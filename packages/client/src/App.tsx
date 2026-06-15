@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { ChessBoard } from './ChessBoard.js';
+import { ChessBoard3D } from './ChessBoard3D.js';
 import { createGame, makeMove, joinGame, subscribeToGame, GameResponse, Difficulty } from './api.js';
 import { loginAsGuest, getStoredAuth, storeAuth, AuthResponse } from './auth.js';
 
@@ -35,6 +36,14 @@ export default function App() {
   const [auth, setAuth] = useState<AuthResponse | null>(getStoredAuth);
   const [roomCode, setRoomCode] = useState('');
   const [joinCode, setJoinCode] = useState('');
+  const [viewMode, setViewMode] = useState<'2d' | '3d'>(() => {
+    const saved = localStorage.getItem('chess-viewmode');
+    return saved === '3d' ? '3d' : '2d';
+  });
+
+  useEffect(() => {
+    localStorage.setItem('chess-viewmode', viewMode);
+  }, [viewMode]);
 
   const isPlayerTurn = gameData ? gameData.turn === playerColor : false;
 
@@ -185,7 +194,12 @@ export default function App() {
       <div className="app">
         <header className="app-header">
           <h1>NetworkChess</h1>
-          {auth && <span style={{ color: '#888', fontSize: '0.85rem' }}>Playing as {auth.username}</span>}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
+            {auth && <span style={{ color: '#888', fontSize: '0.85rem' }}>Playing as {auth.username}</span>}
+            <button className="btn btn-secondary" onClick={() => setViewMode(viewMode === '2d' ? '3d' : '2d')} style={{ padding: '0.4rem 0.8rem', fontSize: '0.82rem' }}>
+              {viewMode === '2d' ? '🌐 Play in 3D' : '📄 Play in 2D'}
+            </button>
+          </div>
         </header>
         <div className="start-screen">
           <h2>Choose Game Mode</h2>
@@ -295,19 +309,36 @@ export default function App() {
     <div className="app">
       <header className="app-header">
         <h1>NetworkChess</h1>
-        {auth && <span style={{ color: '#888', fontSize: '0.85rem' }}>{auth.username}</span>}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
+          {auth && <span style={{ color: '#888', fontSize: '0.85rem' }}>{auth.username}</span>}
+          <button className="btn btn-secondary" onClick={() => setViewMode(viewMode === '2d' ? '3d' : '2d')} style={{ padding: '0.4rem 0.8rem', fontSize: '0.82rem' }}>
+            {viewMode === '2d' ? '🌐 Play in 3D' : '📄 Play in 2D'}
+          </button>
+        </div>
       </header>
       <div className="game-container">
         <div className="board-wrapper">
-          <ChessBoard
-            fen={gameData?.fen || ''}
-            selectedSquare={selectedSquare}
-            legalTargets={legalTargets}
-            lastMove={lastMove}
-            playerColor={playerColor}
-            onSquareClick={handleSquareClick}
-            isFlipped={playerColor === 'b'}
-          />
+          {viewMode === '3d' ? (
+            <ChessBoard3D
+              fen={gameData?.fen || ''}
+              selectedSquare={selectedSquare}
+              legalTargets={legalTargets}
+              lastMove={lastMove}
+              playerColor={playerColor}
+              onSquareClick={handleSquareClick}
+              isFlipped={playerColor === 'b'}
+            />
+          ) : (
+            <ChessBoard
+              fen={gameData?.fen || ''}
+              selectedSquare={selectedSquare}
+              legalTargets={legalTargets}
+              lastMove={lastMove}
+              playerColor={playerColor}
+              onSquareClick={handleSquareClick}
+              isFlipped={playerColor === 'b'}
+            />
+          )}
         </div>
         <div className="sidebar">
           <div className="game-info">
