@@ -39,11 +39,36 @@ jobs:
       - name: Build All Workspaces
         run: npm run build
 
-      # Note: To trigger automated deployment to hosting platforms:
-      # - For Railway: Enable Railway's Github integration. Railway automatically waits for all GitHub check runs to pass before deploying by default.
-      # - For Render: You can trigger a deployment by calling Render's deploy hook URL using curl.
-      # Example deploy step for Render:
-      # - name: Trigger Deploy on Render
-      #   if: github.ref == 'refs/heads/main' && success()
-      #   run: |
-      #     curl -X POST "${{ secrets.RENDER_DEPLOY_HOOK_URL }}"
+  deploy:
+    name: Deploy to GCP
+    needs: validate
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Google Auth
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Build & Push via Cloud Build
+        run: |
+          gcloud builds submit --tag australia-southeast1-docker.pkg.dev/network-chess-1599f/network-chess/server:latest
+
+      - name: Deploy to Cloud Run
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: network-chess
+          region: australia-southeast1
+          image: australia-southeast1-docker.pkg.dev/network-chess-1599f/network-chess/server:latest
+          flags: |
+            --add-cloudsql-instances=network-chess-1599f:australia-southeast1:network-chess-db
+            --set-env-vars=DATABASE_URL=postgresql://postgres:ChessDbPass1599f!@localhost/chess?host=/cloudsql/network-chess-1599f:australia-southeast1:network-chess-db
+            --port=3001
+            --memory=512Mi
