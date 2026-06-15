@@ -1,0 +1,24 @@
+{
+  "name": "network-chess",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "packages/chess-core",
+    "packages/chess-engine",
+    "packages/server",
+    "packages/client"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "dev": "concurrently \"npm run dev -w @network-chess/server\" \"npm run dev -w @network-chess/client\"",
+    "dev:server": "npm run dev -w @network-chess/server",
+    "dev:client": "npm run dev -w @network-chess/client",
+    "test": "npm run test --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2",
+    "typescript": "^5.4.0"
+  }
+}

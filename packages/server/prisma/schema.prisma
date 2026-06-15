@@ -1,0 +1,52 @@
+datasource db {
+  provider = "postgresql"
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model User {
+  id           String         @id @default(uuid())
+  username     String         @unique
+  passwordHash String
+  elo          Int            @default(1200)
+  gamesPlayed  Int            @default(0)
+  wins         Int            @default(0)
+  losses         Int            @default(0)
+  draws        Int            @default(0)
+  createdAt    DateTime       @default(now())
+  tokens       Token[]
+  matchHistory MatchHistory[]
+}
+
+model Token {
+  id        String   @id @default(uuid())
+  token     String   @unique
+  username  String
+  user      User     @relation(fields: [username], references: [username], onDelete: Cascade)
+  createdAt DateTime @default(now())
+}
+
+model Game {
+  id              String   @id
+  stateJson       String   // Store serialized GameState
+  statusJson      String   // Store serialized GameStatus
+  positionHistory String   // JSON array of FENs (stored as stringified array)
+  gameType        String   // "pve" | "pvp"
+  playerColor     String   // "w" | "b"
+  aiColor         String   // "w" | "b"
+  difficulty      String   // "easy" | "medium" | "hard"
+  playerCount     Int      @default(1)
+  createdAt       DateTime @default(now())
+}
+
+model MatchHistory {
+  id           String   @id @default(uuid())
+  userUsername String
+  user         User     @relation(fields: [userUsername], references: [username], onDelete: Cascade)
+  gameId       String
+  opponent     String
+  result       String
+  date         DateTime @default(now())
+}
