@@ -42,6 +42,20 @@ function serializeGameFromDb(game: any): Record<string, unknown> {
   const state = JSON.parse(game.stateJson) as GameState;
   const status = JSON.parse(game.statusJson) as GameStatus;
 
+  // Reconstruct game states sequentially to generate correct SAN notation
+  let tempState = createInitialGameState();
+  const moveHistoryWithSan = state.moveHistory.map((m) => {
+    const san = moveToSan(tempState, m);
+    const result = makeMove(tempState, m);
+    tempState = result.newState;
+    return {
+      from: m.from,
+      to: m.to,
+      promotion: m.promotion || null,
+      san,
+    };
+  });
+
   return {
     id: game.id,
     fen: toFen(
@@ -59,12 +73,7 @@ function serializeGameFromDb(game: any): Record<string, unknown> {
       to: m.to,
       promotion: m.promotion || null,
     })),
-    moveHistory: state.moveHistory.map((m) => ({
-      from: m.from,
-      to: m.to,
-      promotion: m.promotion || null,
-      san: moveToSan(state, m),
-    })),
+    moveHistory: moveHistoryWithSan,
     capturedPieces: {
       w: state.capturedPieces[Color.White].map((p) => ({ type: p.type, color: p.color })),
       b: state.capturedPieces[Color.Black].map((p) => ({ type: p.type, color: p.color })),

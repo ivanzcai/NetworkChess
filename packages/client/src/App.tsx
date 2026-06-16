@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { ChessBoard } from './ChessBoard.js';
+import { ChessScene } from './components/ChessScene.js';
 import { createGame, makeMove, joinGame, subscribeToGame, GameResponse, Difficulty } from './api.js';
 import { loginAsGuest, getStoredAuth, storeAuth, AuthResponse } from './auth.js';
 
@@ -41,7 +41,7 @@ export default function App() {
   // Auto guest login on startup
   useEffect(() => {
     if (!auth) {
-      loginAsGuest().then((a) => { setAuth(a); storeAuth(a); }).catch(() => {});
+      loginAsGuest().then((a) => { setAuth(a); storeAuth(a); }).catch(() => { });
     }
   }, []);
 
@@ -148,7 +148,7 @@ export default function App() {
         setGameData(updatedGame);
         setAiThinking(false);
       },
-      () => {}
+      () => { }
     );
     return cleanup;
   }, [gameData?.id]);
@@ -184,8 +184,11 @@ export default function App() {
     return (
       <div className="app">
         <header className="app-header">
-          <h1>NetworkChess</h1>
-          {auth && <span style={{ color: '#888', fontSize: '0.85rem' }}>Playing as {auth.username}</span>}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+            <img src="/logo.png" alt="SkyMate Logo" style={{ width: '45px', height: '45px', borderRadius: '8px', boxShadow: '0 0 10px var(--accent-glow)' }} />
+            <h1>SkyMate</h1>
+          </div>
+          {auth && <span style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>Playing as {auth.username}</span>}
         </header>
         <div className="start-screen">
           <h2>Choose Game Mode</h2>
@@ -262,18 +265,6 @@ export default function App() {
                       placeholder="Room code"
                       value={joinCode}
                       onChange={(e) => setJoinCode(e.target.value.toUpperCase().slice(0, 8))}
-                      style={{
-                        padding: '0.6rem 1rem',
-                        borderRadius: '6px',
-                        border: '1px solid #2a2a4a',
-                        background: '#0d1b3e',
-                        color: '#e0e0e0',
-                        fontSize: '1rem',
-                        textTransform: 'uppercase',
-                        letterSpacing: '2px',
-                        width: '160px',
-                        textAlign: 'center',
-                      }}
                       onKeyDown={(e) => { if (e.key === 'Enter') handleJoinGame(); }}
                     />
                     <button className="btn btn-primary" onClick={handleJoinGame} disabled={loading || !joinCode.trim()}>
@@ -294,12 +285,15 @@ export default function App() {
   return (
     <div className="app">
       <header className="app-header">
-        <h1>NetworkChess</h1>
-        {auth && <span style={{ color: '#888', fontSize: '0.85rem' }}>{auth.username}</span>}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+          <img src="/logo.png" alt="SkyMate Logo" style={{ width: '40px', height: '40px', borderRadius: '8px', boxShadow: '0 0 8px var(--accent-glow)' }} />
+          <h1>SkyMate</h1>
+        </div>
+        {auth && <span style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>{auth.username}</span>}
       </header>
       <div className="game-container">
         <div className="board-wrapper">
-          <ChessBoard
+          <ChessScene
             fen={gameData?.fen || ''}
             selectedSquare={selectedSquare}
             legalTargets={legalTargets}
@@ -307,6 +301,8 @@ export default function App() {
             playerColor={playerColor}
             onSquareClick={handleSquareClick}
             isFlipped={playerColor === 'b'}
+            status={gameData?.status}
+            turn={gameData?.turn}
           />
         </div>
         <div className="sidebar">
@@ -329,10 +325,10 @@ export default function App() {
                 {gameData?.status.type === 'checkmate'
                   ? `Checkmate! ${gameData.status.winner === playerColor ? 'You win!' : gameMode === 'pve' ? 'AI wins!' : 'Opponent wins!'}`
                   : gameData?.status.type === 'stalemate'
-                  ? 'Stalemate \u2014 Draw!'
-                  : gameData?.status.type === 'draw'
-                  ? `Draw \u2014 ${gameData.status.reason}`
-                  : 'Check!'}
+                    ? 'Stalemate \u2014 Draw!'
+                    : gameData?.status.type === 'draw'
+                      ? `Draw \u2014 ${gameData.status.reason}`
+                      : 'Check!'}
               </span>
             )}
           </div>
