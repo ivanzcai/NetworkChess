@@ -13,14 +13,33 @@ export interface GameResponse {
   difficulty: Difficulty;
   fullMoveNumber: number;
   yourColor?: 'w' | 'b';
+  chat?: { sender: string; text: string; timestamp: number }[];
+  whiteUsername?: string | null;
+  blackUsername?: string | null;
 }
 
 const BASE_URL = '/api';
 
+function getAuthHeader(): Record<string, string> {
+  const stored = localStorage.getItem('chess-auth');
+  if (stored) {
+    try {
+      const auth = JSON.parse(stored);
+      if (auth && auth.token) {
+        return { 'Authorization': `Bearer ${auth.token}` };
+      }
+    } catch {}
+  }
+  return {};
+}
+
 export async function createGame(gameType: 'pve' | 'pvp' = 'pve', playerColor: 'w' | 'b' = 'w', difficulty: Difficulty = 'medium'): Promise<GameResponse> {
   const res = await fetch(`${BASE_URL}/games`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 
+      'Content-Type': 'application/json',
+      ...getAuthHeader()
+    },
     body: JSON.stringify({ gameType, playerColor, difficulty }),
   });
   if (!res.ok) throw new Error('Failed to create game');
@@ -30,6 +49,9 @@ export async function createGame(gameType: 'pve' | 'pvp' = 'pve', playerColor: '
 export async function joinGame(gameId: string): Promise<GameResponse> {
   const res = await fetch(`${BASE_URL}/games/${gameId}/join`, {
     method: 'POST',
+    headers: {
+      ...getAuthHeader()
+    }
   });
   if (!res.ok) {
     const err = await res.json();
@@ -39,7 +61,11 @@ export async function joinGame(gameId: string): Promise<GameResponse> {
 }
 
 export async function getGame(id: string): Promise<GameResponse> {
-  const res = await fetch(`${BASE_URL}/games/${id}`);
+  const res = await fetch(`${BASE_URL}/games/${id}`, {
+    headers: {
+      ...getAuthHeader()
+    }
+  });
   if (!res.ok) throw new Error('Game not found');
   return res.json();
 }
@@ -52,12 +78,31 @@ export async function makeMove(
 ): Promise<GameResponse> {
   const res = await fetch(`${BASE_URL}/games/${id}/move`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 
+      'Content-Type': 'application/json',
+      ...getAuthHeader()
+    },
     body: JSON.stringify({ from, to, promotion }),
   });
   if (!res.ok) {
     const err = await res.json();
     throw new Error(err.error || 'Invalid move');
+  }
+  return res.json();
+}
+
+export async function sendChatMessage(gameId: string, sender: string, text: string): Promise<GameResponse> {
+  const res = await fetch(`${BASE_URL}/games/${gameId}/chat`, {
+    method: 'POST',
+    headers: { 
+      'Content-Type': 'application/json',
+      ...getAuthHeader()
+    },
+    body: JSON.stringify({ sender, text }),
+  });
+  if (!res.ok) {
+    const err = await res.json();
+    throw new Error(err.error || 'Failed to send message');
   }
   return res.json();
 }

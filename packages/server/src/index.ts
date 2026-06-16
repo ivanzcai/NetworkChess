@@ -82,6 +82,9 @@ function serializeGameFromDb(game: any): Record<string, unknown> {
     playerColor: game.playerColor,
     difficulty: game.difficulty,
     fullMoveNumber: state.fullMoveNumber,
+    chat: JSON.parse(game.chatJson || '[]'),
+    whiteUsername: game.whiteUsername || null,
+    blackUsername: game.blackUsername || null,
   };
 }
 
@@ -98,7 +101,13 @@ function broadcastGame(gameId: string, serializedGameData: Record<string, unknow
   }
 }
 
-async function createGame(gameType: 'pve' | 'pvp', playerColor: Color = Color.White, difficulty: Difficulty = 'medium') {
+async function createGame(
+  gameType: 'pve' | 'pvp',
+  playerColor: Color = Color.White,
+  difficulty: Difficulty = 'medium',
+  whiteUsername: string | null = null,
+  blackUsername: string | null = null
+) {
   const id = uuidv4().slice(0, 8);
   const state = createInitialGameState();
   const initialFen = toFen(
@@ -113,6 +122,25 @@ async function createGame(gameType: 'pve' | 'pvp', playerColor: Color = Color.Wh
   const status: GameStatus = { type: 'active' };
   const positionHistory = [initialFen];
 
+  // For PvE, set the other color as "Computer"
+  let white = whiteUsername;
+  let black = blackUsername;
+  if (gameType === 'pve') {
+    if (playerColor === Color.White) {
+      black = 'Computer';
+    } else {
+      white = 'Computer';
+    }
+  }
+
+  const initialChat = gameType === 'pve' ? [
+    {
+      sender: 'SkyMate AI',
+      text: "Good luck! Let's have a great game.",
+      timestamp: Date.now()
+    }
+  ] : [];
+
   const game = await prisma.game.create({
     data: {
       id,
@@ -124,6 +152,9 @@ async function createGame(gameType: 'pve' | 'pvp', playerColor: Color = Color.Wh
       aiColor: playerColor === Color.White ? Color.Black : Color.White,
       difficulty,
       playerCount: 1,
+      whiteUsername: white,
+      blackUsername: black,
+      chatJson: JSON.stringify(initialChat),
     }
   });
 
@@ -188,7 +219,12 @@ app.post('/api/games', async (req, res) => {
   try {
     const { gameType = 'pve', playerColor = 'w', difficulty = 'medium' } = req.body;
     const color = playerColor === 'b' ? Color.Black : Color.White;
-    const game = await createGame(gameType, color, difficulty as Difficulty);
+
+    const username = await getUsernameFromToken(req);
+    const whiteUser = color === Color.White ? username : null;
+    const blackUser = color === Color.Black ? username : null;
+
+    const game = await createGame(gameType, color, difficulty as Difficulty, whiteUser, blackUser);
 
     let state = JSON.parse(game.stateJson) as GameState;
 
@@ -232,13 +268,19 @@ app.post('/api/games/:id/join', async (req, res) => {
       return res.status(400).json({ error: 'Game is full' });
     }
 
+    const joinerUsername = await getUsernameFromToken(req);
     const joinerColor = game.playerColor === Color.White ? Color.Black : Color.White;
+
+    const dataToUpdate: any = { playerCount: 2 };
+    if (joinerColor === Color.White) {
+      dataToUpdate.whiteUsername = joinerUsername;
+    } else {
+      dataToUpdate.blackUsername = joinerUsername;
+    }
     
     const updatedGame = await prisma.game.update({
       where: { id: game.id },
-      data: {
-        playerCount: 2
-      }
+      data: dataToUpdate
     });
 
     res.json({ ...serializeGameFromDb(updatedGame), yourColor: joinerColor });
@@ -261,6 +303,150 @@ app.get('/api/games/:id', async (req, res) => {
     res.status(500).json({ error: 'Internal server error' });
   }
 });
+
+async function checkAndResolveGame(gameId: string) {
+  try {
+    const game = await prisma.game.findUnique({ where: { id: gameId } });
+    if (!game) return;
+
+    const status = JSON.parse(game.statusJson) as GameStatus;
+    if (status.type === 'active' || status.type === 'check') {
+      return;
+    }
+
+    const alreadyResolved = await prisma.matchHistory.findFirst({
+      where: { gameId }
+    });
+    if (alreadyResolved) {
+      return;
+    }
+
+    const whiteUser = game.whiteUsername;
+    const blackUser = game.blackUsername;
+
+    const whitePlayer = whiteUser && whiteUser !== 'Computer'
+      ? await prisma.user.findUnique({ where: { username: whiteUser } })
+      : null;
+    const blackPlayer = blackUser && blackUser !== 'Computer'
+      ? await prisma.user.findUnique({ where: { username: blackUser } })
+      : null;
+
+    const getAiElo = (diff: string) => {
+      if (diff === 'easy') return 800;
+      if (diff === 'hard') return 1600;
+      return 1200;
+    };
+
+    const rWhite = whitePlayer ? whitePlayer.elo : (whiteUser === 'Computer' ? getAiElo(game.difficulty) : 1000);
+    const rBlack = blackPlayer ? blackPlayer.elo : (blackUser === 'Computer' ? getAiElo(game.difficulty) : 1000);
+
+    let outcome = 0.5;
+    if (status.type === 'checkmate') {
+      outcome = status.winner === 'w' ? 1.0 : 0.0;
+    }
+
+    const eWhite = 1 / (1 + Math.pow(10, (rBlack - rWhite) / 400));
+    const eBlack = 1 / (1 + Math.pow(10, (rWhite - rBlack) / 400));
+
+    const deltaWhite = Math.round(32 * (outcome - eWhite));
+    const deltaBlack = Math.round(32 * ((1 - outcome) - eBlack));
+
+    let systemMessage = '';
+    if (status.type === 'checkmate') {
+      const winnerName = status.winner === 'w' ? (whiteUser || 'White') : (blackUser || 'Black');
+      systemMessage = `Game Over: ${winnerName} wins by checkmate!`;
+    } else if (status.type === 'stalemate') {
+      systemMessage = `Game Over: Draw by stalemate.`;
+    } else {
+      systemMessage = `Game Over: Draw (${status.reason || 'agreement'}).`;
+    }
+
+    if (whitePlayer) {
+      const wResult = outcome === 1 ? 'win' : (outcome === 0 ? 'loss' : 'draw');
+      await prisma.user.update({
+        where: { username: whiteUser! },
+        data: {
+          elo: { increment: deltaWhite },
+          gamesPlayed: { increment: 1 },
+          wins: { increment: outcome === 1 ? 1 : 0 },
+          losses: { increment: outcome === 0 ? 1 : 0 },
+          draws: { increment: outcome === 0.5 ? 1 : 0 },
+        }
+      });
+      await prisma.matchHistory.create({
+        data: {
+          userUsername: whiteUser!,
+          gameId,
+          opponent: blackUser || 'Guest',
+          result: wResult,
+        }
+      });
+      systemMessage += ` ${whiteUser} ELO: ${rWhite} -> ${rWhite + deltaWhite} (${deltaWhite >= 0 ? '+' : ''}${deltaWhite}).`;
+    }
+
+    if (blackPlayer) {
+      const bResult = outcome === 0 ? 'win' : (outcome === 1 ? 'loss' : 'draw');
+      await prisma.user.update({
+        where: { username: blackUser! },
+        data: {
+          elo: { increment: deltaBlack },
+          gamesPlayed: { increment: 1 },
+          wins: { increment: outcome === 0 ? 1 : 0 },
+          losses: { increment: outcome === 1 ? 1 : 0 },
+          draws: { increment: outcome === 0.5 ? 1 : 0 },
+        }
+      });
+      await prisma.matchHistory.create({
+        data: {
+          userUsername: blackUser!,
+          gameId,
+          opponent: whiteUser || 'Guest',
+          result: bResult,
+        }
+      });
+      systemMessage += ` ${blackUser} ELO: ${rBlack} -> ${rBlack + deltaBlack} (${deltaBlack >= 0 ? '+' : ''}${deltaBlack}).`;
+    }
+
+    const chat = JSON.parse(game.chatJson || '[]');
+    chat.push({
+      sender: 'SkyMate System',
+      text: systemMessage,
+      timestamp: Date.now()
+    });
+
+    if (game.gameType === 'pve') {
+      let aiComment = '';
+      const userIsWhite = game.playerColor === 'w';
+      const userWon = (userIsWhite && outcome === 1) || (!userIsWhite && outcome === 0);
+      
+      if (status.type === 'checkmate') {
+        if (userWon) {
+          aiComment = "Congratulations! You played a brilliant game.";
+        } else {
+          aiComment = "Good game! Better luck next time.";
+        }
+      } else {
+        aiComment = "A very close match! Well played.";
+      }
+      chat.push({
+        sender: 'SkyMate AI',
+        text: aiComment,
+        timestamp: Date.now() + 50
+      });
+    }
+
+    const finalGame = await prisma.game.update({
+      where: { id: gameId },
+      data: {
+        chatJson: JSON.stringify(chat)
+      }
+    });
+
+    broadcastGame(gameId, serializeGameFromDb(finalGame));
+  } catch (error) {
+    console.error("Failed to resolve game outcomes:", error);
+  }
+}
 
 // Make a move
 app.post('/api/games/:id/move', async (req, res) => {
@@ -301,6 +487,10 @@ app.post('/api/games/:id/move', async (req, res) => {
     const serialized = serializeGameFromDb(updatedGame);
     broadcastGame(game.id, serialized);
 
+    if (newStatus.type !== 'active' && newStatus.type !== 'check') {
+      checkAndResolveGame(game.id);
+    }
+
     // AI response for PvE
     if (
       game.gameType === 'pve' &&
@@ -328,8 +518,43 @@ app.post('/api/games/:id/move', async (req, res) => {
               }
             });
 
-            const aiSerialized = serializeGameFromDb(aiUpdatedGame);
-            broadcastGame(game.id, aiSerialized);
+            if (aiStatus.type !== 'active' && aiStatus.type !== 'check') {
+              checkAndResolveGame(game.id);
+            } else {
+              const chat = JSON.parse(aiUpdatedGame.chatJson || '[]');
+              let aiText = '';
+              if (aiStatus.type === 'check') {
+                aiText = "Check! Keep your King safe.";
+              } else if (Math.random() < 0.15) {
+                const comments = [
+                  "Hmm, let's see how you handle this.",
+                  "Your turn! Make it count.",
+                  "Interesting move. Here is my reply.",
+                  "Nice play! Let's keep it going.",
+                  "I see your plan...",
+                  "Let's see what happens next."
+                ];
+                aiText = comments[Math.floor(Math.random() * comments.length)];
+              }
+
+              let finalAiUpdatedGame = aiUpdatedGame;
+              if (aiText) {
+                chat.push({
+                  sender: 'SkyMate AI',
+                  text: aiText,
+                  timestamp: Date.now()
+                });
+                finalAiUpdatedGame = await prisma.game.update({
+                  where: { id: game.id },
+                  data: {
+                    chatJson: JSON.stringify(chat)
+                  }
+                });
+              }
+
+              const aiSerialized = serializeGameFromDb(finalAiUpdatedGame);
+              broadcastGame(game.id, aiSerialized);
+            }
           }
         } catch (err) {
           console.error("Error in AI move execution:", err);
@@ -414,6 +639,43 @@ app.get('/api/games/:id/stream', async (req, res) => {
   }
 });
 
+// Send a chat message
+app.post('/api/games/:id/chat', async (req, res) => {
+  try {
+    const game = await prisma.game.findUnique({ where: { id: req.params.id.toLowerCase() } });
+    if (!game) {
+      return res.status(404).json({ error: 'Game not found' });
+    }
+
+    const { sender, text } = req.body;
+    if (!sender || !text || !text.trim()) {
+      return res.status(400).json({ error: 'Sender and text are required' });
+    }
+
+    const chat = JSON.parse(game.chatJson || '[]');
+    chat.push({
+      sender,
+      text: text.trim(),
+      timestamp: Date.now()
+    });
+
+    const updatedGame = await prisma.game.update({
+      where: { id: game.id },
+      data: {
+        chatJson: JSON.stringify(chat)
+      }
+    });
+
+    const serialized = serializeGameFromDb(updatedGame);
+    broadcastGame(game.id, serialized);
+
+    res.json(serialized);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // ── Health Check ──
 app.get('/api/health', async (_req, res) => {
   try {
@@ -433,6 +695,15 @@ function hashPassword(password: string): string {
 
 function generateToken(): string {
   return crypto.randomBytes(32).toString('hex');
+}
+
+async function getUsernameFromToken(req: express.Request): Promise<string | null> {
+  const tokenVal = req.headers.authorization?.replace('Bearer ', '');
+  if (!tokenVal) return null;
+  const tokenObj = await prisma.token.findUnique({
+    where: { token: tokenVal },
+  });
+  return tokenObj ? tokenObj.username : null;
 }
 
 // Register
