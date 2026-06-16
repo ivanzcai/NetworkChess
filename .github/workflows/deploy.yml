@@ -27,6 +27,11 @@ jobs:
       - name: Generate Prisma Client
         run: npm run prisma:generate -w @network-chess/server
 
+      - name: Build Core & Engine (needed for typecheck)
+        run: |
+          npm run build -w @network-chess/core
+          npm run build -w @network-chess/engine
+
       - name: Run Typecheck
         run: npm run typecheck
 
