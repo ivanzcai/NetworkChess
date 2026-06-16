@@ -38,6 +38,9 @@ model Game {
   aiColor         String   // "w" | "b"
   difficulty      String   // "easy" | "medium" | "hard"
   playerCount     Int      @default(1)
+  chatJson        String   @default("[]")
+  whiteUsername   String?
+  blackUsername   String?
   createdAt       DateTime @default(now())
 }
 
