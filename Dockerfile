@@ -20,6 +20,6 @@ EXPOSE 3001
 ENV PORT=3001
 ENV NODE_ENV=production
 
-CMD ["sh", "-c", "npm run prisma:migrate -w @network-chess/server && node packages/server/dist/index.js"]
+CMD ["node", "packages/server/dist/index.js"]
 
 
