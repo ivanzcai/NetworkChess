@@ -66,7 +66,16 @@ jobs:
 
       - name: Build & Push via Cloud Build
         run: |
-          gcloud builds submit --tag australia-southeast1-docker.pkg.dev/network-chess-1599f/network-chess/server:latest --suppress-logs
+          cat <<EOF > /tmp/cloudbuild.yaml
+          steps:
+            - name: 'gcr.io/cloud-builders/docker'
+              args: ['build', '-t', 'australia-southeast1-docker.pkg.dev/network-chess-1599f/network-chess/server:latest', '.']
+          images:
+            - 'australia-southeast1-docker.pkg.dev/network-chess-1599f/network-chess/server:latest'
+          options:
+            logging: CLOUD_LOGGING_ONLY
+          EOF
+          gcloud builds submit --config=/tmp/cloudbuild.yaml
 
       - name: Deploy to Cloud Run
         uses: google-github-actions/deploy-cloudrun@v2
