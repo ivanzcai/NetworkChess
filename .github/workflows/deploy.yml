@@ -81,7 +81,7 @@ jobs:
           chmod +x cloud-sql-proxy
           ./cloud-sql-proxy network-chess-1599f:australia-southeast1:network-chess-db &
           sleep 3
-          npx prisma migrate deploy --schema=packages/server/prisma/schema.prisma
+          npm run prisma:migrate -w @network-chess/server
 
       - name: Build & Push via Cloud Build
         run: |
