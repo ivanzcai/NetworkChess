@@ -64,6 +64,25 @@ jobs:
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Run Database Migrations
+        env:
+          DATABASE_URL: "postgresql://postgres:ChessDbPass1599f!@127.0.0.1:5432/chess"
+        run: |
+          curl -o cloud-sql-proxy https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/v2.11.0/cloud-sql-proxy.linux.amd64
+          chmod +x cloud-sql-proxy
+          ./cloud-sql-proxy network-chess-1599f:australia-southeast1:network-chess-db &
+          sleep 3
+          npx prisma migrate deploy --schema=packages/server/prisma/schema.prisma
+
       - name: Build & Push via Cloud Build
         run: |
           cat <<EOF > /tmp/cloudbuild.yaml
@@ -85,6 +104,6 @@ jobs:
           image: australia-southeast1-docker.pkg.dev/network-chess-1599f/network-chess/server:latest
           flags: |
             --add-cloudsql-instances=network-chess-1599f:australia-southeast1:network-chess-db
-            --set-env-vars=DATABASE_URL=postgresql://postgres:ChessDbPass1599f!@localhost/chess?host=/cloudsql/network-chess-1599f:australia-southeast1:network-chess-db
+            --set-env-vars=DATABASE_URL=postgresql://postgres:ChessDbPass1599f!@/chess?host=/cloudsql/network-chess-1599f:australia-southeast1:network-chess-db
             --port=3001
             --memory=512Mi
