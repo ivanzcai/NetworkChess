@@ -1,3 +1,40 @@
+-- ============================================================================
+-- Bootstrap migration: email + OAuth + magic-link authentication
+--
+-- This is a destructive-by-design migration that DROPs and re-CREATEs the
+-- four pre-existing tables (`User`, `Token`, `Game`, `MatchHistory`) that
+-- were created by two since-deleted migrations
+--   - `20260611083520_init`
+--   - `20260617082049_add_chat_and_usernames`
+-- Those migrations were applied to the prod Cloud SQL instance on
+-- earlier deploys, so the old schema is already there. It used a
+-- username-and-password identity model (`User.username` was the FK
+-- identity referenced by `Token`, `Game`, and `MatchHistory`); THIS
+-- migration moves to an email + OAuth + magic-link model where those
+-- four tables FK back to `User.id` instead of `User.username` and adds
+-- `OAuthAccount` / `MagicCode` as new sign-in methods.
+--
+-- Surgically patching the old tables (renaming columns, swapping FK
+-- targets, backfilling `User.email` for existing rows) would require a
+-- row-by-row data pipeline. For this service the prior rows were
+-- `Guest_…` test accounts and any users created under the previous
+-- schema, which can re-sign-up under the new flow. If your prod has
+-- rows you MUST keep, take a Cloud SQL export FIRST and write a
+-- side-by-side data migration before merging this.
+--
+-- Each DROP uses CASCADE so dependent foreign-key constraints drop with
+-- the table; we then recreate them via plain `ALTER TABLE ... ADD
+-- CONSTRAINT` (no DO-$$ try/catch wrappers needed -- the FKs don't
+-- exist after the CASCADE).
+-- ============================================================================
+
+-- Drop pre-existing tables (dependents first; User last). CASCADE removes
+-- dependent FK constraints automatically.
+DROP TABLE IF EXISTS "MatchHistory" CASCADE;
+DROP TABLE IF EXISTS "Token"      CASCADE;
+DROP TABLE IF EXISTS "Game"       CASCADE;
+DROP TABLE IF EXISTS "User"       CASCADE;
+
 -- CreateTable
 CREATE TABLE "User" (
     "id" TEXT NOT NULL,
