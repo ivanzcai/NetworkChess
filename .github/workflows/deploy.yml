@@ -107,6 +107,21 @@ jobs:
             echo "::error::cloud-sql-proxy did not become ready on 127.0.0.1:5432 within 30s"
             exit 1
           fi
+          # Clear any pre-existing FAILED state for our migration before
+          # migrate deploy runs. Prisma's P3009 aborts migrate deploy if
+          # _prisma_migrations has any failed-but-unresolved rows from a
+          # previous CI run -- even after we edited the migration SQL to
+          # address the original failure. `--rolled-back` flips the
+          # `_prisma_migrations.status` row from `failed` to `rolled_back`,
+          # after which `migrate deploy` treats it as pending and re-runs
+          # the SQL. `cd packages/server` is required because Prisma 7
+          # looks up `prisma.config.ts` package-relative; workspace-root
+          # `npx` would not find it.
+          # 2>/dev/null silences Prisma's "migration not found" stderr on
+          # subsequent clean deploys. `|| true` keeps the step idempotent:
+          # when the migrations table is already clean, log nothing and
+          # continue.
+          (cd packages/server && npx prisma migrate resolve --rolled-back 20260618005706_oauth_and_magic_links 2>/dev/null) || true
           npm run prisma:migrate -w @network-chess/server
 
       - name: Build & Push via Cloud Build
