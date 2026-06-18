@@ -48,7 +48,7 @@ export default function App() {
   // Chat state
   const [chatMessage, setChatMessage] = useState('');
   const [chatLoading, setChatLoading] = useState(false);
-  const chatEndRef = useRef<HTMLDivElement>(null);
+  const chatMessagesRef = useRef<HTMLDivElement>(null);
 
   const isPlayerTurn = gameData ? gameData.turn === playerColor : false;
 
@@ -76,12 +76,18 @@ export default function App() {
     }
   }, [auth]);
 
-  // Auto scroll chat
+  // Auto scroll chat — only when a new message is actually appended (use length,
+  // not the chat array reference, since the server serializes a fresh array on every
+  // SSE update). Scroll within the chat container so the page doesn't jump to the
+  // bottom on mobile (where chat sits at the bottom of a long stacked layout).
   useEffect(() => {
-    if (chatEndRef.current) {
-      chatEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    if (chatMessagesRef.current) {
+      chatMessagesRef.current.scrollTo({
+        top: chatMessagesRef.current.scrollHeight,
+        behavior: 'smooth',
+      });
     }
-  }, [gameData?.chat]);
+  }, [gameData?.chat?.length]);
 
   const handleLogout = useCallback(async () => {
     clearAuth();
@@ -527,6 +533,40 @@ export default function App() {
       <div className="app">
         {renderHeader()}
         <div className="game-container">
+          <div className="sidebar chat-sidebar">
+            <h3>Game Chat</h3>
+            <div className="chat-messages" ref={chatMessagesRef}>
+              {(gameData?.chat || []).map((msg, i) => {
+                const isSelf = msg.sender === auth?.username;
+                const isSystem = msg.sender === 'SkyMate System';
+                const isAi = msg.sender === 'SkyMate AI';
+                let bubbleClass = 'chat-bubble-opponent';
+                if (isSelf) bubbleClass = 'chat-bubble-self';
+                else if (isSystem) bubbleClass = 'chat-bubble-system';
+                else if (isAi) bubbleClass = 'chat-bubble-ai';
+
+                return (
+                  <div key={i} className={`chat-message ${isSelf ? 'self' : ''} ${isSystem ? 'system' : ''}`}>
+                    {!isSystem && <span className="chat-sender">{msg.sender}</span>}
+                    <div className={`chat-bubble ${bubbleClass}`}>{msg.text}</div>
+                  </div>
+                );
+              })}
+            </div>
+            <form className="chat-input-row" onSubmit={handleSendChat}>
+              <input
+                type="text"
+                placeholder="Type a message..."
+                value={chatMessage}
+                onChange={(e) => setChatMessage(e.target.value)}
+                disabled={chatLoading}
+              />
+              <button type="submit" className="btn btn-primary btn-send" disabled={chatLoading || !chatMessage.trim()}>
+                Send
+              </button>
+            </form>
+          </div>
+
           <div className="board-wrapper">
             <ChessScene
               fen={gameData?.fen || ''}
@@ -540,7 +580,7 @@ export default function App() {
               turn={gameData?.turn}
             />
           </div>
-          <div className="sidebar">
+          <div className="sidebar right-sidebar">
             <div className="game-info">
               {gameMode === 'pvp' && roomCode && (
                 <p style={{ color: 'var(--accent)', fontWeight: 'bold', fontSize: '1.1rem' }}>
@@ -595,41 +635,7 @@ export default function App() {
               </>
             )}
 
-            {/* Chat Panel */}
-            <div className="chat-panel">
-              <h3>Game Chat</h3>
-              <div className="chat-messages">
-                {(gameData?.chat || []).map((msg, i) => {
-                  const isSelf = msg.sender === auth?.username;
-                  const isSystem = msg.sender === 'SkyMate System';
-                  const isAi = msg.sender === 'SkyMate AI';
-                  let bubbleClass = 'chat-bubble-opponent';
-                  if (isSelf) bubbleClass = 'chat-bubble-self';
-                  else if (isSystem) bubbleClass = 'chat-bubble-system';
-                  else if (isAi) bubbleClass = 'chat-bubble-ai';
 
-                  return (
-                    <div key={i} className={`chat-message ${isSelf ? 'self' : ''} ${isSystem ? 'system' : ''}`}>
-                      {!isSystem && <span className="chat-sender">{msg.sender}</span>}
-                      <div className={`chat-bubble ${bubbleClass}`}>{msg.text}</div>
-                    </div>
-                  );
-                })}
-                <div ref={chatEndRef} />
-              </div>
-              <form className="chat-input-row" onSubmit={handleSendChat}>
-                <input
-                  type="text"
-                  placeholder="Type a message..."
-                  value={chatMessage}
-                  onChange={(e) => setChatMessage(e.target.value)}
-                  disabled={chatLoading}
-                />
-                <button type="submit" className="btn btn-primary btn-send" disabled={chatLoading || !chatMessage.trim()}>
-                  Send
-                </button>
-              </form>
-            </div>
 
             <div className="btn-group" style={{ marginTop: '1rem' }}>
               <button className="btn btn-secondary" onClick={newGame}>New Game</button>

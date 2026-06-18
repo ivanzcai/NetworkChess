@@ -49,7 +49,7 @@ body {
 
 .app-header {
   width: 100%;
-  max-width: 1200px;
+  max-width: 1400px;
   display: flex;
   justify-content: space-between;
   align-items: center;
@@ -80,7 +80,7 @@ body {
   align-items: stretch;
   flex-wrap: wrap;
   justify-content: center;
-  max-width: 1200px;
+  max-width: 1400px;
   width: 100%;
 }
 
@@ -608,22 +608,36 @@ body {
 }
 
 /* ── Responsive ── */
-@media (max-width: 1120px) {
-  .board-wrapper {
-    width: 100%;
-    max-width: 680px;
-    height: 520px;
-  }
+/* ── Right Sidebar Button Anchor ── */
+.sidebar.right-sidebar .btn-group {
+  margin-top: auto;
+}
 
+/* ── Responsive ── */
+@media (max-width: 1400px) {
   .game-container {
     flex-direction: column;
     align-items: center;
-    gap: 2rem;
+    gap: 1.5rem;
   }
 
-  .sidebar {
+  .board-wrapper {
+    order: 1;
     width: 100%;
-    max-width: 680px;
+    max-width: 720px;
+    height: 520px;
+  }
+
+  .sidebar.right-sidebar {
+    order: 2;
+    width: 100%;
+    max-width: 720px;
+  }
+
+  .sidebar.chat-sidebar {
+    order: 3;
+    width: 100%;
+    max-width: 720px;
   }
 }
 
@@ -920,32 +934,26 @@ body {
   width: 100%;
 }
 
-/* ── Chat Panel ── */
-.chat-panel {
-  display: flex;
-  flex-direction: column;
-  background: rgba(255, 255, 255, 0.4);
-  border: 1px solid rgba(14, 165, 233, 0.08);
-  border-radius: 12px;
-  padding: 1rem;
-  margin-top: 1.5rem;
-  flex-grow: 1;
-  max-height: 300px;
+/* ── Chat Sidebar (Left Column) ── */
+.sidebar.chat-sidebar .chat-input-row {
+  border-top: 1px solid rgba(14, 165, 233, 0.08);
+  padding-top: 0.75rem;
+  margin-top: 0.75rem;
 }
 
-.chat-panel h3 {
-  font-size: 0.95rem;
-  font-weight: 700;
-  color: var(--text);
-  margin-bottom: 0.5rem;
+.sidebar.chat-sidebar h3 {
   text-transform: uppercase;
   letter-spacing: 0.05em;
+  border-left: none;
+  padding-left: 0;
   border-bottom: 1px solid rgba(14, 165, 233, 0.08);
-  padding-bottom: 0.25rem;
+  padding-bottom: 0.5rem;
+  font-size: 1rem;
 }
 
 .chat-messages {
   flex-grow: 1;
+  min-height: 0;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
