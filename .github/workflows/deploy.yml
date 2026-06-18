@@ -133,6 +133,6 @@ jobs:
           image: australia-southeast1-docker.pkg.dev/network-chess-1599f/network-chess/server:latest
           flags: |
             --add-cloudsql-instances=network-chess-1599f:australia-southeast1:network-chess-db
-            --set-env-vars=DATABASE_URL=postgresql://postgres:ChessDbPass1599f!@/chess?host=/cloudsql/network-chess-1599f:australia-southeast1:network-chess-db
+            --set-env-vars=DATABASE_URL=postgresql://postgres:ChessDbPass1599f!@/chess?host=/cloudsql/network-chess-1599f:australia-southeast1:network-chess-db,OAUTH_REDIRECT_BASE=https://network-chess-249932342883.australia-southeast1.run.app,PUBLIC_BASE_URL=https://network-chess-249932342883.australia-southeast1.run.app,GOOGLE_CLIENT_ID=249932342883-grhpd982fai90ra4js7nom9ffdrvcves.apps.googleusercontent.com,GOOGLE_CLIENT_SECRET=${{ secrets.GOOGLE_CLIENT_SECRET }}
             --port=3001
             --memory=512Mi
