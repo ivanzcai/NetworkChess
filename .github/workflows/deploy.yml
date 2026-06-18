@@ -92,7 +92,10 @@ jobs:
           # Use single-quoted trap so $PROXY_PID isn't expanded at trap-set
           # time -- we want it expanded at fire time, when PROXY_PID is set.
           # ${PROXY_PID:-} defaults to empty so an unset var doesn't error.
-          trap 'kill -TERM "${PROXY_PID:-}" 2>/dev/null; wait "${PROXY_PID:-}" 2>/dev/null' EXIT
+          # ... wait || true absorbs the proxy's SIGTERM exit code (commonly
+          # 143) so the trap returns 0 and set -e doesn't propagate a fake
+          # failure when the step otherwise succeeded.
+          trap 'kill -TERM "${PROXY_PID:-}" 2>/dev/null; wait "${PROXY_PID:-}" 2>/dev/null || true' EXIT
           # Wait up to 30s for the proxy to bind 127.0.0.1:5432. /dev/tcp is
           # a bash-only feature; ubuntu-latest runners default to bash so
           # this works, but a future sh-shell swap would silently break it.
