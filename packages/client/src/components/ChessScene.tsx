@@ -263,7 +263,6 @@ export function ChessScene(props: ChessSceneProps) {
           toneMapping: THREE.ACESFilmicToneMapping,
           toneMappingExposure: 1.5,
         }}
-        style={{ background: 'linear-gradient(180deg, #bae6fd 0%, #f0f9ff 100%)' }}
         onCreated={({ gl }) => {
           gl.shadowMap.enabled = true;
           gl.shadowMap.type = THREE.PCFSoftShadowMap;
