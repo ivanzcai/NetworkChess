@@ -1,7 +1,19 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { ChessScene } from './components/ChessScene.js';
 import { createGame, makeMove, joinGame, subscribeToGame, sendChatMessage, GameResponse, Difficulty } from './api.js';
-import { loginAsGuest, getStoredAuth, storeAuth, register as apiRegister, login as apiLogin, getProfile, clearAuth, AuthResponse, UserProfile } from './auth.js';
+import {
+  requestMagicLink,
+  verifyMagicLink,
+  startGoogleOAuth,
+  devLogin as apiDevLogin,
+  exchangeOAuthRedirectToken,
+  getStoredAuth,
+  storeAuth,
+  getProfile,
+  clearAuth,
+  AuthResponse,
+  UserProfile,
+} from './auth.js';
 
 type PlayerColor = 'w' | 'b';
 type GameMode = 'pve' | 'pvp';
@@ -38,12 +50,24 @@ export default function App() {
 
   // Auth & Profile state
   const [profileData, setProfileData] = useState<UserProfile | null>(null);
-  const [authModalOpen, setAuthModalOpen] = useState(false);
-  const [authModalMode, setAuthModalMode] = useState<'login' | 'register'>('login');
-  const [authUsername, setAuthUsername] = useState('');
-  const [authPassword, setAuthPassword] = useState('');
+  // Auth flow is a small state machine: 'choose' (default view) -> 'email'
+  // -> 'code' (after magic link sent). Errors stay inline; we don't tear
+  // down the modal on transient errors.
+  type AuthStep = 'choose' | 'email' | 'code';
+  const [authStep, setAuthStep] = useState<AuthStep>('choose');
+  const [authEmail, setAuthEmail] = useState('');
+  const [authCode, setAuthCode] = useState('');
+  // When the server is in "dev mode" (no RESEND_API_KEY) it returns the
+  // 6-digit code in /auth/magic-link/request so the user can complete the
+  // flow without a working email. We surface it inline in the modal.
+  const [authDevCode, setAuthDevCode] = useState<string | null>(null);
   const [authError, setAuthError] = useState<string | null>(null);
-  const [authSubmitting, setAuthSubmitting] = useState(false);
+  const [authSending, setAuthSending] = useState(false);
+  const [authVerifying, setAuthVerifying] = useState(false);
+  const [authModalOpen, setAuthModalOpen] = useState(false);
+  // /api/auth/config tells us which sign-in buttons to render.
+  const [googleAvailable, setGoogleAvailable] = useState(false);
+  const [devMode, setDevMode] = useState(false);
 
   // Chat state
   const [chatMessage, setChatMessage] = useState('');
@@ -52,28 +76,75 @@ export default function App() {
 
   const isPlayerTurn = gameData ? gameData.turn === playerColor : false;
 
-  // Auto guest login on startup
+  // OAuth callback detection: Google redirects the browser to /oauth/callback
+  // ?token=...&returnTo=... after the server resolves the consent flow. We
+  // exchange it for an AuthResponse (which validates freshness server-side)
+  // and clear the URL fragment so the user lands on the lobby.
+  // React 18 StrictMode in dev double-invokes effects; without the ref
+  // guard below we'd POST the same T1 to /api/auth/oauth/google/complete
+  // twice, the second call returning 401 "Invalid OAuth token" because T1
+  // was burned on the first call -- and that error clobbers the success
+  // state from the first call.
+  const oauthCallbackHandledRef = useRef(false);
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const url = new URL(window.location.href);
+    if (url.pathname !== '/oauth/callback') return;
+    const token = url.searchParams.get('token');
+    const error = url.searchParams.get('error');
+    const returnTo = url.searchParams.get('returnTo') || '/';
+    if (oauthCallbackHandledRef.current) {
+      // We've already exchanged this token during this mount -- just
+      // strip the URL so the user doesn't see ?token=... in their bar.
+      window.history.replaceState({}, '', returnTo);
+      return;
+    }
+    oauthCallbackHandledRef.current = true;
+    if (token) {
+      exchangeOAuthRedirectToken(token)
+        .then((a) => { setAuth(a); storeAuth(a); })
+        .catch((err) => {
+          console.error('OAuth exchange failed', err);
+          setAuthError(err.message || 'OAuth sign-in failed');
+          setAuthModalOpen(true);
+        })
+        .finally(() => { window.history.replaceState({}, '', returnTo); });
+    } else if (error) {
+      setAuthError(decodeURIComponent(error));
+      setAuthModalOpen(true);
+      window.history.replaceState({}, '', '/');
+    } else {
+      window.history.replaceState({}, '', '/');
+    }
+  }, []);
+
+  // Fetch server-side auth config on mount so the modal knows whether to
+  // show the Google button and the dev-only shortcut.
+  useEffect(() => {
+    fetch('/api/auth/config')
+      .then((r) => r.json())
+      .then((cfg: { googleOAuthConfigured: boolean; emailDevMode: boolean }) => {
+        setGoogleAvailable(Boolean(cfg.googleOAuthConfigured));
+        setDevMode(Boolean(cfg.emailDevMode));
+      })
+      .catch(() => {});
+  }, []);
+
+  // Load profile stats whenever the auth token changes.
   useEffect(() => {
     if (!auth) {
-      loginAsGuest().then((a) => { setAuth(a); storeAuth(a); }).catch(() => { });
-    }
-  }, [auth]);
-
-  // Load profile stats when auth is set and not a guest
-  useEffect(() => {
-    if (auth && !auth.username.startsWith('Guest_')) {
-      getProfile(auth.token)
-        .then((profile) => setProfileData(profile))
-        .catch((err) => {
-          console.error("Failed to load profile:", err);
-          // If token expired, fallback
-          clearAuth();
-          setAuth(null);
-          setProfileData(null);
-        });
-    } else {
       setProfileData(null);
+      return;
     }
+    getProfile(auth.token)
+      .then((profile) => setProfileData(profile))
+      .catch((err) => {
+        console.error('Failed to load profile:', err);
+        // Likely an expired or revoked token -- clear and force re-auth.
+        clearAuth();
+        setAuth(null);
+        setProfileData(null);
+      });
   }, [auth]);
 
   // Auto scroll chat — only when a new message is actually appended (use length,
@@ -89,55 +160,84 @@ export default function App() {
     }
   }, [gameData?.chat?.length]);
 
-  const handleLogout = useCallback(async () => {
+  const handleLogout = useCallback(() => {
     clearAuth();
     setAuth(null);
     setProfileData(null);
-    setLoading(true);
+  }, []);
+
+  const resetAuthModal = useCallback(() => {
+    setAuthStep('choose');
+    setAuthEmail('');
+    setAuthCode('');
+    setAuthDevCode(null);
+    setAuthError(null);
+  }, []);
+
+  const handleSendMagicCode = useCallback(async (email: string) => {
+    setAuthSending(true);
+    setAuthError(null);
+    setAuthDevCode(null);
     try {
-      const a = await loginAsGuest();
-      setAuth(a);
-      storeAuth(a);
+      const r = await requestMagicLink(email);
+      setAuthDevCode(r.devCode);
+      setAuthEmail(email);
+      setAuthStep('code');
     } catch (err) {
-      console.error("Guest login failed after logout:", err);
+      setAuthError(err instanceof Error ? err.message : 'Failed to send code');
     } finally {
-      setLoading(false);
+      setAuthSending(false);
     }
   }, []);
 
-  const handleAuthSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!authUsername.trim() || !authPassword.trim()) {
-      setAuthError('Username and password are required');
-      return;
-    }
-    setAuthSubmitting(true);
+  const handleVerifyMagicCode = useCallback(async (email: string, code: string) => {
+    setAuthVerifying(true);
     setAuthError(null);
     try {
-      let res: AuthResponse;
-      if (authModalMode === 'register') {
-        res = await apiRegister(authUsername.trim(), authPassword.trim());
-      } else {
-        res = await apiLogin(authUsername.trim(), authPassword.trim());
-      }
-      setAuth(res);
-      storeAuth(res);
+      const r = await verifyMagicLink(email, code);
+      setAuth(r);
+      storeAuth(r);
       setAuthModalOpen(false);
-      setAuthUsername('');
-      setAuthPassword('');
-    } catch (err: any) {
-      setAuthError(err.message || 'Authentication failed');
+      resetAuthModal();
+    } catch (err) {
+      setAuthError(err instanceof Error ? err.message : 'Invalid or expired code');
     } finally {
-      setAuthSubmitting(false);
+      setAuthVerifying(false);
     }
-  };
+  }, [resetAuthModal]);
+
+  const handleGoogleSignIn = useCallback(async () => {
+    setAuthError(null);
+    try {
+      const r = await startGoogleOAuth('/');
+      window.location.href = r.authorizeUrl;
+    } catch (err) {
+      setAuthError(err instanceof Error ? err.message : 'Google sign-in not available');
+    }
+  }, []);
+
+  const handleDevLogin = useCallback(async (email: string, displayName: string) => {
+    setAuthSending(true);
+    setAuthError(null);
+    try {
+      const r = await apiDevLogin(email, displayName);
+      setAuth(r);
+      storeAuth(r);
+      setAuthModalOpen(false);
+      resetAuthModal();
+    } catch (err) {
+      setAuthError(err instanceof Error ? err.message : 'Dev sign-in failed');
+    } finally {
+      setAuthSending(false);
+    }
+  }, [resetAuthModal]);
 
   const handleSendChat = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!gameData || !chatMessage.trim() || !auth) return;
     setChatLoading(true);
     try {
-      const updated = await sendChatMessage(gameData.id, auth.username, chatMessage.trim());
+      const updated = await sendChatMessage(gameData.id, auth.displayName, chatMessage.trim());
       setGameData(updated);
       setChatMessage('');
     } catch (err: any) {
@@ -283,7 +383,6 @@ export default function App() {
     : null;
 
   const renderHeader = () => {
-    const isGuest = auth?.username.startsWith('Guest_');
     return (
       <header className="app-header">
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
@@ -291,19 +390,21 @@ export default function App() {
           <h1>SkyMate</h1>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
-          {auth && (
-            <span style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>
-              {isGuest ? `Guest: ${auth.username}` : `Player: ${auth.username}`}
-              {!isGuest && profileData && ` (${profileData.elo} ELO)`}
-            </span>
-          )}
-          {isGuest ? (
-            <button className="btn btn-secondary btn-sm" onClick={() => { setAuthModalMode('login'); setAuthError(null); setAuthModalOpen(true); }}>
-              Sign In / Register
-            </button>
+          {auth ? (
+            <>
+              <span style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>
+                {profileData ? `${auth.displayName} (${profileData.elo} ELO)` : auth.displayName}
+              </span>
+              <button className="btn btn-secondary btn-sm" onClick={handleLogout}>
+                Log Out
+              </button>
+            </>
           ) : (
-            <button className="btn btn-secondary btn-sm" onClick={handleLogout}>
-              Log Out
+            <button
+              className="btn btn-primary btn-sm"
+              onClick={() => { resetAuthModal(); setAuthError(null); setAuthModalOpen(true); }}
+            >
+              Sign In
             </button>
           )}
         </div>
@@ -311,72 +412,150 @@ export default function App() {
     );
   };
 
+  const closeAuthModal = () => {
+    setAuthModalOpen(false);
+    // Slight delay so close animation doesn't blank the values first.
+    setTimeout(resetAuthModal, 200);
+  };
+
   const renderAuthModal = () => {
+    const heading =
+      authStep === 'code' ? 'Enter verification code' :
+      googleAvailable ? 'Sign in to SkyMate' :
+      'Sign in to SkyMate';
+    const subtitle =
+      authStep === 'code'
+        ? `We sent a 6-digit code to ${authEmail}.`
+        : 'Use your email for a one-time code, or continue with Google.';
+
     return (
-      <div className="auth-modal-overlay" onClick={() => setAuthModalOpen(false)}>
+      <div className="auth-modal-overlay" onClick={closeAuthModal}>
         <div className="auth-modal-content" onClick={(e) => e.stopPropagation()}>
-          <button className="auth-modal-close" onClick={() => setAuthModalOpen(false)}>&times;</button>
-          <h2>{authModalMode === 'login' ? 'Sign In' : 'Create Account'}</h2>
-          <form onSubmit={handleAuthSubmit}>
-            <div className="form-group">
-              <label>Username</label>
-              <input
-                type="text"
-                placeholder="Min 2 characters"
-                value={authUsername}
-                onChange={(e) => setAuthUsername(e.target.value)}
-                required
-              />
-            </div>
-            <div className="form-group">
-              <label>Password</label>
-              <input
-                type="password"
-                placeholder="Min 4 characters"
-                value={authPassword}
-                onChange={(e) => setAuthPassword(e.target.value)}
-                required
-              />
-            </div>
-            {authError && <p className="auth-error">{authError}</p>}
-            <button type="submit" className="btn btn-primary w-full" disabled={authSubmitting}>
-              {authSubmitting ? 'Submitting...' : (authModalMode === 'login' ? 'Log In' : 'Register')}
-            </button>
-          </form>
-          <div className="auth-modal-switch">
-            {authModalMode === 'login' ? (
-              <p>
-                New to SkyMate?{' '}
-                <a href="#" onClick={(e) => { e.preventDefault(); setAuthModalMode('register'); setAuthError(null); }}>
-                  Create an account
-                </a>
-              </p>
-            ) : (
-              <p>
-                Already have an account?{' '}
-                <a href="#" onClick={(e) => { e.preventDefault(); setAuthModalMode('login'); setAuthError(null); }}>
-                  Sign in
-                </a>
-              </p>
-            )}
-          </div>
+          <button className="auth-modal-close" onClick={closeAuthModal}>&times;</button>
+          <h2>{heading}</h2>
+          <p style={{ color: 'var(--text-muted)', fontSize: '0.9rem', marginTop: '-0.5rem', marginBottom: '1rem' }}>
+            {subtitle}
+          </p>
+
+          {authStep === 'choose' && (
+            <>
+              {googleAvailable && (
+                <>
+                  <button
+                    type="button"
+                    className="btn btn-secondary w-full google-signin-btn"
+                    onClick={handleGoogleSignIn}
+                  >
+                    <span className="google-g">G</span> Continue with Google
+                  </button>
+                  <div className="auth-divider"><span>or</span></div>
+                </>
+              )}
+
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  if (authEmail.trim()) handleSendMagicCode(authEmail.trim());
+                }}
+              >
+                <div className="form-group">
+                  <label>Email</label>
+                  <input
+                    type="email"
+                    placeholder="you@example.com"
+                    value={authEmail}
+                    onChange={(e) => setAuthEmail(e.target.value)}
+                    required
+                    autoComplete="email"
+                  />
+                </div>
+                {authError && <p className="auth-error">{authError}</p>}
+                <button
+                  type="submit"
+                  className="btn btn-primary w-full"
+                  disabled={authSending || !authEmail.trim()}
+                >
+                  {authSending ? 'Sending code\u2026' : 'Email me a code'}
+                </button>
+              </form>
+
+              {devMode && (
+                <>
+                  <div className="auth-divider"><span>dev shortcut</span></div>
+                  <DevLoginForm onSubmit={handleDevLogin} disabled={authSending} />
+                </>
+              )}
+            </>
+          )}
+
+          {authStep === 'code' && (
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                handleVerifyMagicCode(authEmail, authCode);
+              }}
+            >
+              {authDevCode && (
+                <div className="dev-code-banner">
+                  Dev mode: your code is <code>{authDevCode}</code>
+                </div>
+              )}
+              {!authDevCode && (
+                <p style={{ color: 'var(--text-muted)', fontSize: '0.85rem' }}>
+                  Check your inbox (and spam folder) for the code.
+                </p>
+              )}
+              <div className="form-group">
+                <label>6-digit code</label>
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  pattern="[0-9]{6}"
+                  maxLength={6}
+                  placeholder="123456"
+                  value={authCode}
+                  onChange={(e) => setAuthCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                  required
+                  autoFocus
+                />
+              </div>
+              {authError && <p className="auth-error">{authError}</p>}
+              <button
+                type="submit"
+                className="btn btn-primary w-full"
+                disabled={authVerifying || authCode.length !== 6}
+              >
+                {authVerifying ? 'Verifying\u2026' : 'Verify and sign in'}
+              </button>
+              <button
+                type="button"
+                className="btn btn-link"
+                onClick={() => { setAuthStep('choose'); setAuthError(null); setAuthCode(''); }}
+                style={{ marginTop: '0.75rem' }}
+              >
+                Use a different email
+              </button>
+            </form>
+          )}
         </div>
       </div>
     );
   };
 
   if (!gameStarted) {
-    const isGuest = auth?.username.startsWith('Guest_');
     return (
       <>
         <div className="app">
           {renderHeader()}
-          
-          {isGuest && (
+
+          {!auth && (
             <div className="guest-upgrade-banner">
-              <span>You are playing as Guest. Create a permanent account to track your ELO rating and view past matches!</span>
-              <button className="btn btn-primary btn-sm" onClick={() => { setAuthModalMode('register'); setAuthError(null); setAuthModalOpen(true); }}>
-                Register Now
+              <span>Sign in to track your ELO rating and view past matches.</span>
+              <button
+                className="btn btn-primary btn-sm"
+                onClick={() => { resetAuthModal(); setAuthError(null); setAuthModalOpen(true); }}
+              >
+                Sign In
               </button>
             </div>
           )}
@@ -537,7 +716,7 @@ export default function App() {
             <h3>Game Chat</h3>
             <div className="chat-messages" ref={chatMessagesRef}>
               {(gameData?.chat || []).map((msg, i) => {
-                const isSelf = msg.sender === auth?.username;
+                const isSelf = msg.sender === auth?.displayName;
                 const isSystem = msg.sender === 'SkyMate System';
                 const isAi = msg.sender === 'SkyMate AI';
                 let bubbleClass = 'chat-bubble-opponent';
@@ -698,4 +877,44 @@ function renderMoveHistory(moves: { from: number; to: number; san: string }[]) {
     );
   }
   return rows;
+}
+
+// Tiny inline form for dev-mode shortcut: POSTs { email, displayName } to
+// /api/auth/dev/login so we can test the full flow without a working
+// Resend account or Google OAuth app. Server only honors this in non-prod.
+function DevLoginForm({ onSubmit, disabled }: { onSubmit: (email: string, displayName: string) => void; disabled: boolean }) {
+  const [email, setEmail] = useState('');
+  const [displayName, setDisplayName] = useState('');
+  return (
+    <form
+      onSubmit={(e) => {
+        e.preventDefault();
+        if (email.trim()) onSubmit(email.trim(), displayName.trim() || email.split('@')[0]);
+      }}
+      style={{ marginTop: '0.5rem' }}
+    >
+      <div className="form-group" style={{ marginBottom: '0.5rem' }}>
+        <input
+          type="email"
+          placeholder="dev@example.com"
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+          required
+          autoComplete="off"
+        />
+      </div>
+      <div className="form-group" style={{ marginBottom: '0.75rem' }}>
+        <input
+          type="text"
+          placeholder="Display name (optional)"
+          value={displayName}
+          onChange={(e) => setDisplayName(e.target.value)}
+          autoComplete="off"
+        />
+      </div>
+      <button type="submit" className="btn btn-secondary w-full" disabled={disabled || !email.trim()}>
+        Dev sign-in
+      </button>
+    </form>
+  );
 }

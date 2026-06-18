@@ -7,6 +7,7 @@
   --accent: #0ea5e9;
   /* Indigo */
   --accent-light: #38bdf8;
+  --accent-bright: #7dd3fc;
   --accent-glow: rgba(14, 165, 233, 0.2);
   --secondary-accent: #f59e0b;
   --secondary-glow: rgba(245, 158, 11, 0.2);
@@ -1056,4 +1057,72 @@ body {
 .btn-send {
   padding: 0.5rem 1rem !important;
   font-size: 0.85rem !important;
+}
+
+/* ── Auth modal: magic-link flow, divider, dev banner, Google button ── */
+.btn-link {
+  background: transparent;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  padding: 0;
+  font-size: 0.9rem;
+  text-decoration: underline;
+}
+.btn-link:hover {
+  color: var(--accent-bright);
+}
+.auth-divider {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin: 1.25rem 0;
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+.auth-divider::before,
+.auth-divider::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: rgba(255, 255, 255, 0.08);
+}
+.dev-code-banner {
+  background: rgba(99, 102, 241, 0.12);
+  border: 1px solid rgba(99, 102, 241, 0.4);
+  border-radius: 8px;
+  padding: 0.75rem 1rem;
+  margin-bottom: 1rem;
+  color: var(--text);
+  font-size: 0.85rem;
+}
+.dev-code-banner code {
+  background: rgba(0, 0, 0, 0.3);
+  padding: 0.15rem 0.5rem;
+  border-radius: 4px;
+  font-size: 1rem;
+  letter-spacing: 0.15em;
+  font-weight: 600;
+  color: var(--accent-bright);
+}
+.google-signin-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.6rem;
+  font-weight: 500;
+}
+.google-g {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.4rem;
+  height: 1.4rem;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #4285F4, #34A853 50%, #FBBC05 75%, #EA4335);
+  color: white;
+  font-weight: 700;
+  font-size: 0.9rem;
 }

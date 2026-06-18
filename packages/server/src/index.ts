@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import path from 'node:path';
@@ -24,16 +25,42 @@ import { PrismaPg } from '@prisma/adapter-pg';
 import pg from 'pg';
 import crypto from 'crypto';
 
+import {
+  sendMagicCodeEmail,
+  generateSixDigitCode,
+  hashMagicCode,
+  isEmailDevMode,
+} from './email.js';
+import {
+  isGoogleOAuthConfigured,
+  startGoogleOAuthFlow,
+  completeGoogleOAuthFlow,
+  getPublicBaseUrl,
+} from './oauthGoogle.js';
+
 const app = express();
 const PORT = process.env.PORT || 3001;
+// Disable dangerous dev fallbacks in production.
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 
-const connectionString = process.env.DATABASE_URL || "postgresql://postgres:postgres@localhost:5432/chess?schema=public";
+const connectionString =
+  process.env.DATABASE_URL ||
+  'postgresql://postgres:postgres@localhost:5432/chess?schema=public';
 const pool = new pg.Pool({ connectionString });
 const adapter = new PrismaPg(pool);
 const prisma = new PrismaClient({ adapter });
 
 app.use(cors());
 app.use(express.json());
+
+// Make this reachable from the client so the UI can decide whether to show
+// the Google button at all (vs. just disabling it on click).
+app.get('/api/auth/config', (_req, res) => {
+  res.json({
+    googleOAuthConfigured: isGoogleOAuthConfigured(),
+    emailDevMode: isEmailDevMode(),
+  });
+});
 
 // ── Game Connection Storage (in-memory) ──
 const activeSseClients: Map<string, Set<(data: string) => void>> = new Map();
@@ -101,12 +128,59 @@ function broadcastGame(gameId: string, serializedGameData: Record<string, unknow
   }
 }
 
+interface Identity {
+  userId: string;
+  email: string;
+  displayName: string;
+}
+
+function generateToken(): string {
+  return crypto.randomBytes(32).toString('hex');
+}
+
+async function getUserFromToken(req: express.Request): Promise<Identity | null> {
+  const tokenVal = req.headers.authorization?.replace('Bearer ', '');
+  if (!tokenVal) return null;
+  const tokenObj = await prisma.token.findUnique({
+    where: { token: tokenVal },
+    include: { user: true },
+  });
+  if (!tokenObj || !tokenObj.user) return null;
+  return {
+    userId: tokenObj.user.id,
+    email: tokenObj.user.email,
+    displayName: tokenObj.user.displayName,
+  };
+}
+
+function deriveDisplayNameFromEmail(email: string): string {
+  const at = email.indexOf('@');
+  return (at > 0 ? email.slice(0, at) : email) || 'Player';
+}
+
+async function findOrCreateUserByEmail(emailRaw: string): Promise<{ userId: string; displayName: string }> {
+  const email = emailRaw.toLowerCase().trim();
+  const existing = await prisma.user.findUnique({ where: { email } });
+  if (existing) return { userId: existing.id, displayName: existing.displayName };
+  const user = await prisma.user.create({
+    data: {
+      email,
+      displayName: deriveDisplayNameFromEmail(email),
+      elo: 1200,
+      gamesPlayed: 0,
+      wins: 0,
+      losses: 0,
+      draws: 0,
+    },
+  });
+  return { userId: user.id, displayName: user.displayName };
+}
+
 async function createGame(
   gameType: 'pve' | 'pvp',
   playerColor: Color = Color.White,
   difficulty: Difficulty = 'medium',
-  whiteUsername: string | null = null,
-  blackUsername: string | null = null
+  creator: Identity | null = null
 ) {
   const id = uuidv4().slice(0, 8);
   const state = createInitialGameState();
@@ -122,14 +196,31 @@ async function createGame(
   const status: GameStatus = { type: 'active' };
   const positionHistory = [initialFen];
 
-  // For PvE, set the other color as "Computer"
-  let white = whiteUsername;
-  let black = blackUsername;
+  // For PvE, the AI takes the opposite seat. For PvP, only the creator's seat
+  // is filled until someone joins.
+  let whiteUsername: string | null = null;
+  let blackUsername: string | null = null;
+  let whiteUserId: string | null = null;
+  let blackUserId: string | null = null;
   if (gameType === 'pve') {
     if (playerColor === Color.White) {
-      black = 'Computer';
+      whiteUsername = creator?.displayName ?? null;
+      whiteUserId = creator?.userId ?? null;
+      blackUsername = 'Computer';
+      blackUserId = null;
     } else {
-      white = 'Computer';
+      whiteUsername = 'Computer';
+      whiteUserId = null;
+      blackUsername = creator?.displayName ?? null;
+      blackUserId = creator?.userId ?? null;
+    }
+  } else if (creator) {
+    if (playerColor === Color.White) {
+      whiteUsername = creator.displayName;
+      whiteUserId = creator.userId;
+    } else {
+      blackUsername = creator.displayName;
+      blackUserId = creator.userId;
     }
   }
 
@@ -137,7 +228,7 @@ async function createGame(
     {
       sender: 'SkyMate AI',
       text: "Good luck! Let's have a great game.",
-      timestamp: Date.now()
+      timestamp: Date.now(),
     }
   ] : [];
 
@@ -152,27 +243,41 @@ async function createGame(
       aiColor: playerColor === Color.White ? Color.Black : Color.White,
       difficulty,
       playerCount: 1,
-      whiteUsername: white,
-      blackUsername: black,
+      whiteUsername,
+      blackUsername,
+      whiteUserId,
+      blackUserId,
       chatJson: JSON.stringify(initialChat),
-    }
+    },
   });
 
   return game;
 }
 
-function applyMoveToGameState(state: GameState, positionHistory: string[], move: Move): { newState: GameState; newHistory: string[]; fen: string; status: GameStatus } {
+function applyMoveToGameState(
+  state: GameState,
+  positionHistory: string[],
+  move: Move
+): { newState: GameState; newHistory: string[]; fen: string; status: GameStatus } {
   const { newState } = makeMove(state, move);
   const fen = toFen(
-    newState.board, newState.turn, newState.castlingRights,
-    newState.enPassantSquare, newState.halfMoveClock, newState.fullMoveNumber
+    newState.board,
+    newState.turn,
+    newState.castlingRights,
+    newState.enPassantSquare,
+    newState.halfMoveClock,
+    newState.fullMoveNumber
   );
   const newHistory = [...positionHistory, fen];
 
   // Compute status with full position history for threefold detection
   const status = getGameStatus(
-    newState.board, newState.turn, newState.kingsPosition[newState.turn],
-    newState.castlingRights, newState.enPassantSquare, newState.halfMoveClock,
+    newState.board,
+    newState.turn,
+    newState.kingsPosition[newState.turn],
+    newState.castlingRights,
+    newState.enPassantSquare,
+    newState.halfMoveClock,
     newHistory
   );
   return { newState, newHistory, fen, status };
@@ -184,35 +289,22 @@ setInterval(async () => {
     const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
     const staleGames = await prisma.game.findMany({
       where: {
-        createdAt: {
-          lt: oneHourAgo,
-        },
+        createdAt: { lt: oneHourAgo },
       },
-      select: {
-        id: true,
-      },
+      select: { id: true },
     });
 
     if (staleGames.length > 0) {
-      const ids = staleGames.map(g => g.id);
-      await prisma.game.deleteMany({
-        where: {
-          id: {
-            in: ids,
-          },
-        },
-      });
-      // Clean up in-memory SSE clients too
-      for (const id of ids) {
-        activeSseClients.delete(id);
-      }
+      const ids = staleGames.map((g) => g.id);
+      await prisma.game.deleteMany({ where: { id: { in: ids } } });
+      for (const id of ids) activeSseClients.delete(id);
     }
   } catch (error) {
     console.error('Failed to cleanup stale games:', error);
   }
 }, 10 * 60 * 1000);
 
-// ── REST Endpoints ──
+// ── REST Endpoints (games) ──
 
 // Create a new game (PvE or PvP)
 app.post('/api/games', async (req, res) => {
@@ -220,11 +312,8 @@ app.post('/api/games', async (req, res) => {
     const { gameType = 'pve', playerColor = 'w', difficulty = 'medium' } = req.body;
     const color = playerColor === 'b' ? Color.Black : Color.White;
 
-    const username = await getUsernameFromToken(req);
-    const whiteUser = color === Color.White ? username : null;
-    const blackUser = color === Color.Black ? username : null;
-
-    const game = await createGame(gameType, color, difficulty as Difficulty, whiteUser, blackUser);
+    const identity = await getUserFromToken(req);
+    const game = await createGame(gameType, color, difficulty as Difficulty, identity);
 
     let state = JSON.parse(game.stateJson) as GameState;
 
@@ -233,15 +322,19 @@ app.post('/api/games', async (req, res) => {
       const aiMove = getBestMove(state, { difficulty: game.difficulty as Difficulty });
       if (aiMove) {
         const positionHistory = JSON.parse(game.positionHistory) as string[];
-        const { newState, newHistory, status: newStatus } = applyMoveToGameState(state, positionHistory, aiMove);
-        
+        const { newState, newHistory, status: newStatus } = applyMoveToGameState(
+          state,
+          positionHistory,
+          aiMove
+        );
+
         const updatedGame = await prisma.game.update({
           where: { id: game.id },
           data: {
             stateJson: JSON.stringify(newState),
             statusJson: JSON.stringify(newStatus),
             positionHistory: JSON.stringify(newHistory),
-          }
+          },
         });
         return res.json(serializeGameFromDb(updatedGame));
       }
@@ -257,30 +350,32 @@ app.post('/api/games', async (req, res) => {
 // Join a PvP game by room code
 app.post('/api/games/:id/join', async (req, res) => {
   try {
-    const game = await prisma.game.findUnique({ where: { id: req.params.id.toLowerCase() } });
-    if (!game) {
-      return res.status(404).json({ error: 'Game not found' });
-    }
-    if (game.gameType !== 'pvp') {
-      return res.status(400).json({ error: 'Not a PvP game' });
-    }
+    const game = await prisma.game.findUnique({
+      where: { id: req.params.id.toLowerCase() },
+    });
+    if (!game) return res.status(404).json({ error: 'Game not found' });
+    if (game.gameType !== 'pvp') return res.status(400).json({ error: 'Not a PvP game' });
     if (game.playerCount && game.playerCount >= 2) {
       return res.status(400).json({ error: 'Game is full' });
     }
 
-    const joinerUsername = await getUsernameFromToken(req);
+    const identity = await getUserFromToken(req);
+    if (!identity) return res.status(401).json({ error: 'Sign in to join a PvP game' });
+
     const joinerColor = game.playerColor === Color.White ? Color.Black : Color.White;
 
     const dataToUpdate: any = { playerCount: 2 };
     if (joinerColor === Color.White) {
-      dataToUpdate.whiteUsername = joinerUsername;
+      dataToUpdate.whiteUsername = identity.displayName;
+      dataToUpdate.whiteUserId = identity.userId;
     } else {
-      dataToUpdate.blackUsername = joinerUsername;
+      dataToUpdate.blackUsername = identity.displayName;
+      dataToUpdate.blackUserId = identity.userId;
     }
-    
+
     const updatedGame = await prisma.game.update({
       where: { id: game.id },
-      data: dataToUpdate
+      data: dataToUpdate,
     });
 
     res.json({ ...serializeGameFromDb(updatedGame), yourColor: joinerColor });
@@ -293,10 +388,10 @@ app.post('/api/games/:id/join', async (req, res) => {
 // Get game state
 app.get('/api/games/:id', async (req, res) => {
   try {
-    const game = await prisma.game.findUnique({ where: { id: req.params.id.toLowerCase() } });
-    if (!game) {
-      return res.status(404).json({ error: 'Game not found' });
-    }
+    const game = await prisma.game.findUnique({
+      where: { id: req.params.id.toLowerCase() },
+    });
+    if (!game) return res.status(404).json({ error: 'Game not found' });
     res.json(serializeGameFromDb(game));
   } catch (error) {
     console.error(error);
@@ -310,26 +405,21 @@ async function checkAndResolveGame(gameId: string) {
     if (!game) return;
 
     const status = JSON.parse(game.statusJson) as GameStatus;
-    if (status.type === 'active' || status.type === 'check') {
-      return;
-    }
+    if (status.type === 'active' || status.type === 'check') return;
 
-    const alreadyResolved = await prisma.matchHistory.findFirst({
-      where: { gameId }
-    });
-    if (alreadyResolved) {
-      return;
-    }
+    const alreadyResolved = await prisma.matchHistory.findFirst({ where: { gameId } });
+    if (alreadyResolved) return;
 
-    const whiteUser = game.whiteUsername;
-    const blackUser = game.blackUsername;
+    // Identity: prefer the userId FK + look up the current User row so renames
+    // are reflected in ELO/MatchHistory; fall back to the username snapshot
+    // (kept so the AI ELO and message text still have something to show).
+    const whiteId = game.whiteUserId;
+    const blackId = game.blackUserId;
+    const whiteNameSnap = game.whiteUsername;
+    const blackNameSnap = game.blackUsername;
 
-    const whitePlayer = whiteUser && whiteUser !== 'Computer'
-      ? await prisma.user.findUnique({ where: { username: whiteUser } })
-      : null;
-    const blackPlayer = blackUser && blackUser !== 'Computer'
-      ? await prisma.user.findUnique({ where: { username: blackUser } })
-      : null;
+    const whiteUser = whiteId ? await prisma.user.findUnique({ where: { id: whiteId } }) : null;
+    const blackUser = blackId ? await prisma.user.findUnique({ where: { id: blackId } }) : null;
 
     const getAiElo = (diff: string) => {
       if (diff === 'easy') return 800;
@@ -337,8 +427,12 @@ async function checkAndResolveGame(gameId: string) {
       return 1200;
     };
 
-    const rWhite = whitePlayer ? whitePlayer.elo : (whiteUser === 'Computer' ? getAiElo(game.difficulty) : 1000);
-    const rBlack = blackPlayer ? blackPlayer.elo : (blackUser === 'Computer' ? getAiElo(game.difficulty) : 1000);
+    const rWhite = whiteUser
+      ? whiteUser.elo
+      : whiteNameSnap === 'Computer' ? getAiElo(game.difficulty) : 1000;
+    const rBlack = blackUser
+      ? blackUser.elo
+      : blackNameSnap === 'Computer' ? getAiElo(game.difficulty) : 1000;
 
     let outcome = 0.5;
     if (status.type === 'checkmate') {
@@ -349,112 +443,115 @@ async function checkAndResolveGame(gameId: string) {
     const eBlack = 1 / (1 + Math.pow(10, (rWhite - rBlack) / 400));
 
     const deltaWhite = Math.round(32 * (outcome - eWhite));
-    const deltaBlack = Math.round(32 * ((1 - outcome) - eBlack));
+    const deltaBlack = Math.round(32 * (1 - outcome - eBlack));
+
+    // Use the SNAPSHOT (whiteUsername/blackUsername) consistently for BOTH
+    // the chat winner line and the ELO message. This way if the player
+    // renames mid-history, the chat still reads accurately.
+    const whiteDisplayName = whiteNameSnap ?? 'White';
+    const blackDisplayName = blackNameSnap ?? 'Black';
 
     let systemMessage = '';
     if (status.type === 'checkmate') {
-      const winnerName = status.winner === 'w' ? (whiteUser || 'White') : (blackUser || 'Black');
+      const winnerName =
+        status.winner === 'w' ? whiteDisplayName : blackDisplayName;
       systemMessage = `Game Over: ${winnerName} wins by checkmate!`;
     } else if (status.type === 'stalemate') {
-      systemMessage = `Game Over: Draw by stalemate.`;
+      systemMessage = 'Game Over: Draw by stalemate.';
     } else {
       systemMessage = `Game Over: Draw (${status.reason || 'agreement'}).`;
     }
 
-    if (whitePlayer) {
-      const wResult = outcome === 1 ? 'win' : (outcome === 0 ? 'loss' : 'draw');
+    if (whiteUser && whiteId) {
+      const wResult = outcome === 1 ? 'win' : outcome === 0 ? 'loss' : 'draw';
       await prisma.user.update({
-        where: { username: whiteUser! },
+        where: { id: whiteId },
         data: {
           elo: { increment: deltaWhite },
           gamesPlayed: { increment: 1 },
           wins: { increment: outcome === 1 ? 1 : 0 },
           losses: { increment: outcome === 0 ? 1 : 0 },
           draws: { increment: outcome === 0.5 ? 1 : 0 },
-        }
+        },
       });
       await prisma.matchHistory.create({
         data: {
-          userUsername: whiteUser!,
+          userId: whiteId,
           gameId,
-          opponent: blackUser || 'Guest',
+          opponent: blackDisplayName,
           result: wResult,
-        }
+        },
       });
-      systemMessage += ` ${whiteUser} ELO: ${rWhite} -> ${rWhite + deltaWhite} (${deltaWhite >= 0 ? '+' : ''}${deltaWhite}).`;
+      systemMessage += ` ${whiteDisplayName} ELO: ${rWhite} -> ${rWhite + deltaWhite} (${deltaWhite >= 0 ? '+' : ''}${deltaWhite}).`;
     }
 
-    if (blackPlayer) {
-      const bResult = outcome === 0 ? 'win' : (outcome === 1 ? 'loss' : 'draw');
+    if (blackUser && blackId) {
+      const bResult = outcome === 0 ? 'win' : outcome === 1 ? 'loss' : 'draw';
       await prisma.user.update({
-        where: { username: blackUser! },
+        where: { id: blackId },
         data: {
           elo: { increment: deltaBlack },
           gamesPlayed: { increment: 1 },
           wins: { increment: outcome === 0 ? 1 : 0 },
           losses: { increment: outcome === 1 ? 1 : 0 },
           draws: { increment: outcome === 0.5 ? 1 : 0 },
-        }
+        },
       });
       await prisma.matchHistory.create({
         data: {
-          userUsername: blackUser!,
+          userId: blackId,
           gameId,
-          opponent: whiteUser || 'Guest',
+          opponent: whiteDisplayName,
           result: bResult,
-        }
+        },
       });
-      systemMessage += ` ${blackUser} ELO: ${rBlack} -> ${rBlack + deltaBlack} (${deltaBlack >= 0 ? '+' : ''}${deltaBlack}).`;
+      systemMessage += ` ${blackDisplayName} ELO: ${rBlack} -> ${rBlack + deltaBlack} (${deltaBlack >= 0 ? '+' : ''}${deltaBlack}).`;
     }
 
     const chat = JSON.parse(game.chatJson || '[]');
     chat.push({
       sender: 'SkyMate System',
       text: systemMessage,
-      timestamp: Date.now()
+      timestamp: Date.now(),
     });
 
     if (game.gameType === 'pve') {
       let aiComment = '';
       const userIsWhite = game.playerColor === 'w';
       const userWon = (userIsWhite && outcome === 1) || (!userIsWhite && outcome === 0);
-      
+
       if (status.type === 'checkmate') {
-        if (userWon) {
-          aiComment = "Congratulations! You played a brilliant game.";
-        } else {
-          aiComment = "Good game! Better luck next time.";
-        }
+        aiComment = userWon
+          ? 'Congratulations! You played a brilliant game.'
+          : 'Good game! Better luck next time.';
       } else {
-        aiComment = "A very close match! Well played.";
+        aiComment = 'A very close match! Well played.';
       }
       chat.push({
         sender: 'SkyMate AI',
         text: aiComment,
-        timestamp: Date.now() + 50
+        timestamp: Date.now() + 50,
       });
     }
 
     const finalGame = await prisma.game.update({
       where: { id: gameId },
-      data: {
-        chatJson: JSON.stringify(chat)
-      }
+      data: { chatJson: JSON.stringify(chat) },
     });
 
     broadcastGame(gameId, serializeGameFromDb(finalGame));
   } catch (error) {
-    console.error("Failed to resolve game outcomes:", error);
+    console.error('Failed to resolve game outcomes:', error);
   }
 }
 
 // Make a move
 app.post('/api/games/:id/move', async (req, res) => {
   try {
-    const game = await prisma.game.findUnique({ where: { id: req.params.id.toLowerCase() } });
-    if (!game) {
-      return res.status(404).json({ error: 'Game not found' });
-    }
+    const game = await prisma.game.findUnique({
+      where: { id: req.params.id.toLowerCase() },
+    });
+    if (!game) return res.status(404).json({ error: 'Game not found' });
 
     const state = JSON.parse(game.stateJson) as GameState;
     const status = JSON.parse(game.statusJson) as GameStatus;
@@ -471,17 +568,19 @@ app.post('/api/games/:id/move', async (req, res) => {
       return res.status(400).json({ error: 'Illegal move' });
     }
 
-    // Apply player move
-    const { newState, newHistory, status: newStatus } = applyMoveToGameState(state, positionHistory, move);
+    const { newState, newHistory, status: newStatus } = applyMoveToGameState(
+      state,
+      positionHistory,
+      move
+    );
 
-    // Save back to db
     const updatedGame = await prisma.game.update({
       where: { id: game.id },
       data: {
         stateJson: JSON.stringify(newState),
         statusJson: JSON.stringify(newStatus),
         positionHistory: JSON.stringify(newHistory),
-      }
+      },
     });
 
     const serialized = serializeGameFromDb(updatedGame);
@@ -505,9 +604,15 @@ app.post('/api/games/:id/move', async (req, res) => {
           const latestState = JSON.parse(latestGame.stateJson) as GameState;
           const latestHistory = JSON.parse(latestGame.positionHistory) as string[];
 
-          const aiMove = getBestMove(latestState, { difficulty: latestGame.difficulty as Difficulty });
+          const aiMove = getBestMove(latestState, {
+            difficulty: latestGame.difficulty as Difficulty,
+          });
           if (aiMove) {
-            const { newState: aiState, newHistory: aiHistory, status: aiStatus } = applyMoveToGameState(latestState, latestHistory, aiMove);
+            const {
+              newState: aiState,
+              newHistory: aiHistory,
+              status: aiStatus,
+            } = applyMoveToGameState(latestState, latestHistory, aiMove);
 
             const aiUpdatedGame = await prisma.game.update({
               where: { id: game.id },
@@ -515,7 +620,7 @@ app.post('/api/games/:id/move', async (req, res) => {
                 stateJson: JSON.stringify(aiState),
                 statusJson: JSON.stringify(aiStatus),
                 positionHistory: JSON.stringify(aiHistory),
-              }
+              },
             });
 
             if (aiStatus.type !== 'active' && aiStatus.type !== 'check') {
@@ -524,31 +629,25 @@ app.post('/api/games/:id/move', async (req, res) => {
               const chat = JSON.parse(aiUpdatedGame.chatJson || '[]');
               let aiText = '';
               if (aiStatus.type === 'check') {
-                aiText = "Check! Keep your King safe.";
+                aiText = 'Check! Keep your King safe.';
               } else if (Math.random() < 0.15) {
                 const comments = [
                   "Hmm, let's see how you handle this.",
-                  "Your turn! Make it count.",
-                  "Interesting move. Here is my reply.",
+                  'Your turn! Make it count.',
+                  'Interesting move. Here is my reply.',
                   "Nice play! Let's keep it going.",
-                  "I see your plan...",
-                  "Let's see what happens next."
+                  'I see your plan...',
+                  "Let's see what happens next.",
                 ];
                 aiText = comments[Math.floor(Math.random() * comments.length)];
               }
 
               let finalAiUpdatedGame = aiUpdatedGame;
               if (aiText) {
-                chat.push({
-                  sender: 'SkyMate AI',
-                  text: aiText,
-                  timestamp: Date.now()
-                });
+                chat.push({ sender: 'SkyMate AI', text: aiText, timestamp: Date.now() });
                 finalAiUpdatedGame = await prisma.game.update({
                   where: { id: game.id },
-                  data: {
-                    chatJson: JSON.stringify(chat)
-                  }
+                  data: { chatJson: JSON.stringify(chat) },
                 });
               }
 
@@ -557,7 +656,7 @@ app.post('/api/games/:id/move', async (req, res) => {
             }
           }
         } catch (err) {
-          console.error("Error in AI move execution:", err);
+          console.error('Error in AI move execution:', err);
         }
       }, 300);
     }
@@ -572,10 +671,10 @@ app.post('/api/games/:id/move', async (req, res) => {
 // Get legal moves for a square
 app.get('/api/games/:id/moves/:square', async (req, res) => {
   try {
-    const game = await prisma.game.findUnique({ where: { id: req.params.id.toLowerCase() } });
-    if (!game) {
-      return res.status(404).json({ error: 'Game not found' });
-    }
+    const game = await prisma.game.findUnique({
+      where: { id: req.params.id.toLowerCase() },
+    });
+    if (!game) return res.status(404).json({ error: 'Game not found' });
 
     const state = JSON.parse(game.stateJson) as GameState;
     const square = parseInt(req.params.square);
@@ -601,10 +700,10 @@ app.get('/api/games', async (_req, res) => {
 // ── SSE Endpoint ──
 app.get('/api/games/:id/stream', async (req, res) => {
   try {
-    const game = await prisma.game.findUnique({ where: { id: req.params.id.toLowerCase() } });
-    if (!game) {
-      return res.status(404).json({ error: 'Game not found' });
-    }
+    const game = await prisma.game.findUnique({
+      where: { id: req.params.id.toLowerCase() },
+    });
+    if (!game) return res.status(404).json({ error: 'Game not found' });
 
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
@@ -629,9 +728,7 @@ app.get('/api/games/:id/stream', async (req, res) => {
 
     req.on('close', () => {
       clients?.delete(send);
-      if (clients?.size === 0) {
-        activeSseClients.delete(game.id);
-      }
+      if (clients?.size === 0) activeSseClients.delete(game.id);
     });
   } catch (error) {
     console.error(error);
@@ -639,31 +736,34 @@ app.get('/api/games/:id/stream', async (req, res) => {
   }
 });
 
-// Send a chat message
+// Send a chat message. `sender` is the user's displayName; we derive it from
+// the bearer token and ignore the body value so a compromised client can't
+// impersonate another player.
 app.post('/api/games/:id/chat', async (req, res) => {
   try {
-    const game = await prisma.game.findUnique({ where: { id: req.params.id.toLowerCase() } });
-    if (!game) {
-      return res.status(404).json({ error: 'Game not found' });
-    }
+    const game = await prisma.game.findUnique({
+      where: { id: req.params.id.toLowerCase() },
+    });
+    if (!game) return res.status(404).json({ error: 'Game not found' });
 
-    const { sender, text } = req.body;
-    if (!sender || !text || !text.trim()) {
-      return res.status(400).json({ error: 'Sender and text are required' });
+    const identity = await getUserFromToken(req);
+    if (!identity) return res.status(401).json({ error: 'Sign in to chat' });
+
+    const { text } = req.body;
+    if (!text || !text.trim()) {
+      return res.status(400).json({ error: 'text is required' });
     }
 
     const chat = JSON.parse(game.chatJson || '[]');
     chat.push({
-      sender,
-      text: text.trim(),
-      timestamp: Date.now()
+      sender: identity.displayName,
+      text: text.trim().slice(0, 500),
+      timestamp: Date.now(),
     });
 
     const updatedGame = await prisma.game.update({
       where: { id: game.id },
-      data: {
-        chatJson: JSON.stringify(chat)
-      }
+      data: { chatJson: JSON.stringify(chat) },
     });
 
     const serialized = serializeGameFromDb(updatedGame);
@@ -687,171 +787,314 @@ app.get('/api/health', async (_req, res) => {
   }
 });
 
-// ── Auth (Prisma-backed) ──
+// ── Auth (email-first: passwordless magic link + Google OAuth + dev fallback) ──
 
-function hashPassword(password: string): string {
-  return crypto.createHash('sha256').update(password + 'chess-salt').digest('hex');
-}
+const MAGIC_CODE_TTL_MS = 10 * 60 * 1000;
+const MAGIC_CODE_COOLDOWN_MS = 60 * 1000;
 
-function generateToken(): string {
-  return crypto.randomBytes(32).toString('hex');
-}
-
-async function getUsernameFromToken(req: express.Request): Promise<string | null> {
-  const tokenVal = req.headers.authorization?.replace('Bearer ', '');
-  if (!tokenVal) return null;
-  const tokenObj = await prisma.token.findUnique({
-    where: { token: tokenVal },
-  });
-  return tokenObj ? tokenObj.username : null;
-}
-
-// Register
-app.post('/api/auth/register', async (req, res) => {
+// Request a 6-digit code to be sent to `email`. Returns the code inline in
+// dev mode (when RESEND_API_KEY is unset) so the UI can display it for
+// local testing -- production NEVER exposes the code in the response.
+app.post('/api/auth/magic-link/request', async (req, res) => {
   try {
-    const { username, password } = req.body;
-    if (!username || !password || username.length < 2 || password.length < 4) {
-      return res.status(400).json({ error: 'Invalid username or password (min 2 chars / 4 chars)' });
+    const { email } = req.body;
+    const trimmed = (email || '').toLowerCase().trim();
+    if (!/.+@.+\..+/.test(trimmed)) {
+      return res.status(400).json({ error: 'Please enter a valid email address' });
     }
 
-    const existingUser = await prisma.user.findFirst({
-      where: {
-        username: {
-          equals: username,
-          mode: 'insensitive'
-        }
-      }
+    // Cooldown: avoid spamming users (and being billed by Resend).
+    const recent = await prisma.magicCode.findFirst({
+      where: { email: trimmed },
+      orderBy: { createdAt: 'desc' },
     });
-
-    if (existingUser) {
-      return res.status(409).json({ error: 'Username already taken' });
+    if (recent && Date.now() - recent.createdAt.getTime() < MAGIC_CODE_COOLDOWN_MS) {
+      const wait = Math.ceil(
+        (MAGIC_CODE_COOLDOWN_MS - (Date.now() - recent.createdAt.getTime())) / 1000
+      );
+      return res
+        .status(429)
+        .json({ error: `Please wait ${wait}s before requesting another code` });
     }
 
-    const passwordHash = hashPassword(password);
-    const user = await prisma.user.create({
+    // Invalidate any unconsumed codes for this email.
+    await prisma.magicCode.updateMany({
+      where: { email: trimmed, consumed: false },
+      data: { consumed: true, consumedAt: new Date() },
+    });
+
+    const code = generateSixDigitCode();
+    const codeHash = hashMagicCode(code, trimmed);
+    await prisma.magicCode.create({
       data: {
-        username,
-        passwordHash,
-        elo: 1200,
-        gamesPlayed: 0,
-        wins: 0,
-        losses: 0,
-        draws: 0,
-      }
+        email: trimmed,
+        codeHash,
+        expiresAt: new Date(Date.now() + MAGIC_CODE_TTL_MS),
+      },
     });
 
-    const token = generateToken();
-    await prisma.token.create({
-      data: {
-        token,
-        username: user.username,
-      }
-    });
-
-    res.json({ token, username: user.username, elo: user.elo });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Login
-app.post('/api/auth/login', async (req, res) => {
-  try {
-    const { username, password } = req.body;
-    const user = await prisma.user.findFirst({
-      where: {
-        username: {
-          equals: username,
-          mode: 'insensitive'
-        }
-      }
-    });
-
-    if (!user || user.passwordHash !== hashPassword(password)) {
-      return res.status(401).json({ error: 'Invalid credentials' });
+    const sendResult = await sendMagicCodeEmail(trimmed, code);
+    if (!sendResult.success) {
+      return res.status(502).json({ error: sendResult.error || 'Could not send email' });
     }
-
-    const token = generateToken();
-    await prisma.token.create({
-      data: {
-        token,
-        username: user.username,
-      }
-    });
-
-    res.json({ token, username: user.username, elo: user.elo });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Guest login
-app.post('/api/auth/guest', async (_req, res) => {
-  try {
-    const guestName = 'Guest_' + crypto.randomBytes(3).toString('hex');
-    const token = generateToken();
-
-    const user = await prisma.user.create({
-      data: {
-        username: guestName,
-        passwordHash: '',
-        elo: 1000,
-        gamesPlayed: 0,
-        wins: 0,
-        losses: 0,
-        draws: 0,
-      }
-    });
-
-    await prisma.token.create({
-      data: {
-        token,
-        username: guestName,
-      }
-    });
-
-    res.json({ token, username: guestName, elo: 1000 });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Get user profile
-app.get('/api/auth/profile', async (req, res) => {
-  try {
-    const tokenVal = req.headers.authorization?.replace('Bearer ', '');
-    if (!tokenVal) return res.status(401).json({ error: 'No token' });
-
-    const tokenObj = await prisma.token.findUnique({
-      where: { token: tokenVal },
-      include: {
-        user: {
-          include: {
-            matchHistory: true
-          }
-        }
-      }
-    });
-
-    if (!tokenObj) return res.status(401).json({ error: 'Invalid token' });
-    const user = tokenObj.user;
 
     res.json({
-      username: user.username,
+      devCode: isEmailDevMode() ? sendResult.devCode ?? null : null,
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Verify a code and mint a User (if needed) + Token.
+app.post('/api/auth/magic-link/verify', async (req, res) => {
+  try {
+    const { email, code } = req.body;
+    const trimmedEmail = (email || '').toLowerCase().trim();
+    if (!trimmedEmail || !code || code.length !== 6) {
+      return res.status(400).json({ error: 'Email and 6-digit code are required' });
+    }
+
+    const codeHash = hashMagicCode(code, trimmedEmail);
+    const row = await prisma.magicCode.findFirst({
+      where: {
+        email: trimmedEmail,
+        codeHash,
+        consumed: false,
+        expiresAt: { gt: new Date() },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    if (!row) return res.status(401).json({ error: 'Invalid or expired code' });
+
+    // Mark consumed (single-use).
+    await prisma.magicCode.update({
+      where: { id: row.id },
+      data: { consumed: true, consumedAt: new Date() },
+    });
+
+    const { userId, displayName } = await findOrCreateUserByEmail(trimmedEmail);
+    const token = generateToken();
+    await prisma.token.create({
+      data: { token, userId, method: 'magic-link' },
+    });
+
+    const user = await prisma.user.findUnique({ where: { id: userId } });
+    res.json({ token, email: trimmedEmail, displayName, elo: user?.elo ?? 1200 });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Dev shortcut: when NODE_ENV !== "production", sign in as any
+// email/displayName combo without sending a code or going through Google.
+// Disabled in production -- the endpoint returns 404.
+app.post('/api/auth/dev/login', async (req, res) => {
+  if (IS_PRODUCTION) return res.status(404).json({ error: 'Not found' });
+  try {
+    const { email, displayName } = req.body;
+    if (!email || !/.+@.+\..+/.test(email.toLowerCase().trim())) {
+      return res.status(400).json({ error: 'Valid email required' });
+    }
+    const trimmedEmail = email.toLowerCase().trim();
+    const { userId } = await findOrCreateUserByEmail(trimmedEmail);
+    const user = await prisma.user.findUnique({ where: { id: userId } });
+    let nextDisplay = displayName?.trim() || user?.displayName;
+    if (displayName && displayName.trim() && displayName.trim() !== user?.displayName) {
+      await prisma.user.update({
+        where: { id: userId },
+        data: { displayName: displayName.trim() },
+      });
+      nextDisplay = displayName.trim();
+    }
+    const token = generateToken();
+    await prisma.token.create({ data: { token, userId, method: 'dev' } });
+    res.json({
+      token,
+      email: trimmedEmail,
+      displayName: nextDisplay || 'Player',
+      elo: user?.elo ?? 1200,
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Begin a Google OAuth flow. Server returns the consent-screen URL; client
+// redirects the browser to it.
+app.post('/api/auth/oauth/google/start', async (req, res) => {
+  try {
+    if (!isGoogleOAuthConfigured()) {
+      return res
+        .status(503)
+        .json({ error: 'Google sign-in is not configured on this server' });
+    }
+    const returnTo = (req.query.returnTo as string) || '/';
+    const { authorizeUrl } = startGoogleOAuthFlow(returnTo);
+    res.json({ authorizeUrl });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Google redirects the user's browser here with ?code= && ?state=.
+// On success we 302 to /oauth/callback?token=<fresh token> on the SAME host so
+// the SPA can catch it and exchange it for an AuthResponse via
+// /api/auth/oauth/google/complete (kept as a separate endpoint so the
+// redirect can fail with a clean JSON error if something goes wrong).
+app.get('/api/auth/oauth/google/callback', async (req, res) => {
+  try {
+    if (!isGoogleOAuthConfigured()) {
+      return res.status(503).send('Google sign-in not configured');
+    }
+    const code = req.query.code as string | undefined;
+    const state = req.query.state as string | undefined;
+    if (!code || !state) return res.status(400).send('Missing code/state');
+
+    const completed = await completeGoogleOAuthFlow(code, state);
+
+    // Find-or-create the User row. If the email already exists we LINK the
+    // OAuth subject to it; otherwise we create a fresh User. Only the id
+    // is used here -- the SPA fetches canonical email/displayName/elo via
+    // /api/auth/oauth/google/complete so they don't ride along in the
+    // redirect URL (no leak into browser history or Referer).
+    const { userId } = await findOrCreateUserByEmail(completed.email);
+    // Refresh displayName if Google gave us a richer one and the local user
+    // hasn't customised it (default-derived from email local-part).
+    const localUser = await prisma.user.findUnique({ where: { id: userId } });
+    if (
+      localUser &&
+      completed.displayName &&
+      localUser.displayName === deriveDisplayNameFromEmail(completed.email)
+    ) {
+      await prisma.user.update({
+        where: { id: userId },
+        data: { displayName: completed.displayName },
+      });
+    }
+
+    await prisma.oAuthAccount.upsert({
+      where: {
+        provider_subjectId: {
+          provider: 'google',
+          subjectId: completed.subjectId,
+        },
+      },
+      update: { userId },
+      create: {
+        provider: 'google',
+        subjectId: completed.subjectId,
+        userId,
+      },
+    });
+
+    const token = generateToken();
+    await prisma.token.create({ data: { token, userId, method: 'google' } });
+
+    // Redirect ABSOLUTELY to PUBLIC_BASE_URL so dev (server :3001, vite
+    // client :5173) lands on the SPA instead of staying on the API host.
+    // Only include `token` and `returnTo` in the URL -- the SPA fetches
+    // email/displayName via /api/auth/oauth/google/complete so they
+    // don't need to ride along (and shouldn't leak into browser history
+    // or the Referer header).
+    const safeReturn = encodeURIComponent(completed.returnTo || '/');
+    const target =
+      `${getPublicBaseUrl()}/oauth/callback` +
+      `?token=${encodeURIComponent(token)}` +
+      `&returnTo=${safeReturn}`;
+    res.redirect(target);
+  } catch (error) {
+    console.error('Google OAuth callback failed:', error);
+    const msg = encodeURIComponent(
+      error instanceof Error ? error.message : 'OAuth failed'
+    );
+    res.redirect(`${getPublicBaseUrl()}/oauth/callback?error=${msg}`);
+  }
+});
+
+// SPA calls this after catching /oauth/callback?token=... in the URL. It
+// verifies the token is fresh (created in the last few minutes) and returns
+// the canonical AuthResponse.
+app.post('/api/auth/oauth/google/complete', async (req, res) => {
+  try {
+    const { token } = req.body;
+    if (!token) return res.status(400).json({ error: 'token required' });
+
+  const tokenObj = await prisma.token.findUnique({
+    where: { token },
+    include: { user: true },
+  });
+  if (!tokenObj || tokenObj.method !== 'google') {
+    return res.status(401).json({ error: 'Invalid OAuth token' });
+  }
+  if (Date.now() - tokenObj.createdAt.getTime() > 5 * 60 * 1000) {
+    return res.status(401).json({ error: 'OAuth token has expired' });
+  }
+  const user = tokenObj.user;
+  // Single-use: burn the row so the URL can't be replayed (browser history,
+  // Referer header, screen-share, etc.). After this call, the SPA already
+  // stored AuthResponse in localStorage so the user keeps their session.
+  // We catch a delete failure so a transient DB hiccup doesn't kick the
+  // user out (the 5-min freshness window still bounds the leak).
+  await prisma.token
+    .delete({ where: { id: tokenObj.id } })
+    .catch((err) =>
+      console.error('OAuth token cleanup failed (row remains, will TTL via freshness):', err)
+    );
+  // Mint a separate, persistent session token T2. The redirect token T1
+  // (above) has just been deleted from the DB; T2 is what the SPA stores in
+  // localStorage and sends on every subsequent Authorization: Bearer …
+  // call. Without this step every authenticated request after sign-in
+  // would fail, because the bearer value the SPA received was destroyed
+  // along with T1. Method 'google-session' makes the row easy to identify
+  // in DB audits (the magic-link flow uses method='magic-link').
+  const sessionToken = generateToken();
+  await prisma.token.create({
+    data: { token: sessionToken, userId: user.id, method: 'google-session' },
+  });
+  res.json({
+      token: sessionToken,
+      email: user.email,
+      displayName: user.displayName,
+      elo: user.elo,
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Profile of the currently signed-in user.
+app.get('/api/auth/profile', async (req, res) => {
+  try {
+    const identity = await getUserFromToken(req);
+    if (!identity) return res.status(401).json({ error: 'Not authenticated' });
+
+    const user = await prisma.user.findUnique({
+      where: { id: identity.userId },
+      include: { matchHistory: { orderBy: { date: 'desc' }, take: 25 } },
+    });
+    if (!user) return res.status(401).json({ error: 'User not found' });
+
+    res.json({
+      email: user.email,
+      displayName: user.displayName,
       elo: user.elo,
       gamesPlayed: user.gamesPlayed,
       wins: user.wins,
       losses: user.losses,
       draws: user.draws,
-      matchHistory: user.matchHistory.map(m => ({
+      matchHistory: user.matchHistory.map((m) => ({
         gameId: m.gameId,
         opponent: m.opponent,
         result: m.result,
-        date: m.date.getTime()
-      }))
+        date: m.date.getTime(),
+      })),
     });
   } catch (error) {
     console.error(error);

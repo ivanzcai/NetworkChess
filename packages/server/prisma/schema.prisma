@@ -6,50 +6,112 @@ generator client {
   provider = "prisma-client-js"
 }
 
+// ── User identity ──
+// Email is the unique identity. displayName is what other players see in
+// chat. isGuest is reserved for future use (e.g. ephemeral visitors — not
+// currently exposed via any UI).
 model User {
-  id           String         @id @default(uuid())
-  username     String         @unique
-  passwordHash String
-  elo          Int            @default(1200)
-  gamesPlayed  Int            @default(0)
-  wins         Int            @default(0)
-  losses         Int            @default(0)
-  draws        Int            @default(0)
-  createdAt    DateTime       @default(now())
-  tokens       Token[]
-  matchHistory MatchHistory[]
+  id            String          @id @default(uuid())
+  email         String          @unique
+  displayName  String
+  isGuest       Boolean         @default(false)
+  elo           Int             @default(1200)
+  gamesPlayed   Int             @default(0)
+  wins          Int             @default(0)
+  losses        Int             @default(0)
+  draws         Int             @default(0)
+  createdAt     DateTime        @default(now())
+  tokens        Token[]
+  matchHistory  MatchHistory[]
+  oauthAccounts OAuthAccount[]
+  whiteGames    Game[]          @relation("whiteUser")
+  blackGames    Game[]          @relation("blackUser")
+
+  @@index([email])
 }
 
+// ── OAuth accounts linked to a User ──
+// One User can have many OAuth accounts across providers.
+// `provider + subjectId` is unique so re-signing-in with the same Google
+// account always lands on the same User row.
+model OAuthAccount {
+  id        String   @id @default(uuid())
+  provider  String   // "google"
+  subjectId String   // provider-side stable user id (e.g. Google `sub`)
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@unique([provider, subjectId])
+  @@index([userId])
+}
+
+// ── Magic-link one-time codes ──
+// Each row is a 6-digit code sent to an email address. Code is stored
+// hashed (sha256). Codes expire after 10 minutes and are single-use.
+model MagicCode {
+  id         String    @id @default(uuid())
+  email      String    // lowercased
+  codeHash   String    // sha256(code + chess-magic-salt)
+  expiresAt  DateTime
+  consumed   Boolean   @default(false)
+  consumedAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([email])
+  @@index([expiresAt])
+}
+
+// ── Bearer tokens (the only auth artifact clients need to keep) ──
+// `method` records how this token was minted (magic-link | google | dev).
 model Token {
   id        String   @id @default(uuid())
   token     String   @unique
-  username  String
-  user      User     @relation(fields: [username], references: [username], onDelete: Cascade)
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  method    String?  // "magic-link" | "google" | "dev"
   createdAt DateTime @default(now())
+
+  @@index([userId])
 }
 
+// ── Game record ──
+// `whiteUsername` / `blackUsername` are kept as plain display strings
+// (snapshot of the User.displayName at game-creation time, so old games
+// keep their names even if the User renames) and ALSO as FK columns so
+// we can still find the User for ELO updates.
 model Game {
   id              String   @id
-  stateJson       String   // Store serialized GameState
-  statusJson      String   // Store serialized GameStatus
-  positionHistory String   // JSON array of FENs (stored as stringified array)
-  gameType        String   // "pve" | "pvp"
-  playerColor     String   // "w" | "b"
-  aiColor         String   // "w" | "b"
-  difficulty      String   // "easy" | "medium" | "hard"
+  stateJson       String
+  statusJson      String
+  positionHistory String
+  gameType        String
+  playerColor     String
+  aiColor         String
+  difficulty      String
   playerCount     Int      @default(1)
   chatJson        String   @default("[]")
   whiteUsername   String?
   blackUsername   String?
+  whiteUserId     String?
+  blackUserId     String?
+  whiteUser       User?    @relation("whiteUser", fields: [whiteUserId], references: [id])
+  blackUser       User?    @relation("blackUser", fields: [blackUserId], references: [id])
   createdAt       DateTime @default(now())
+
+  @@index([whiteUserId])
+  @@index([blackUserId])
 }
 
+// ── Per-user game history (snapshot at game-end) ──
 model MatchHistory {
-  id           String   @id @default(uuid())
-  userUsername String
-  user         User     @relation(fields: [userUsername], references: [username], onDelete: Cascade)
-  gameId       String
-  opponent     String
-  result       String
-  date         DateTime @default(now())
+  id       String   @id @default(uuid())
+  userId   String
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  gameId   String
+  opponent String
+  result   String
+  date     DateTime @default(now())
+
+  @@index([userId])
 }
